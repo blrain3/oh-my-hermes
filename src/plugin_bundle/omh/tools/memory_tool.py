@@ -92,6 +92,7 @@ from ..memory_admission import (
     MODEL_CAPTURE_SOURCE,
     _days_after,
     _staleness_projection,
+    _supersede_corrected_record_unlocked,
     capture_project_memory_candidate,
     demotion_refusal_reason,
     held_durable_user_global_record,
@@ -104,10 +105,13 @@ from ..memory_recall_support import (
     PROJECT_MEMORY_RECORD_SCHEMA_VERSION,
     _REVIEW_DEFAULT_DAYS,
     _cadence_value,
+    _parse_utc_naive_as_utc,
     _record_perspective_matches,
     _record_resolution,
     _record_staleness,
     _retention_class,
+    normalize_memory_subject,
+    record_subject,
 )
 from ..memory_records import (
     DEFAULT_RECORD_LIMIT,
@@ -149,6 +153,10 @@ CAPTURE_RETENTION_CLASSES = ("durable", "standard", "volatile")
 # Admission stores at most this many summary characters.
 CAPTURE_SUMMARY_MAX_CHARS = 500
 CAPTURE_MAX_TAGS = 8
+SUBJECT_NEXT_ACTION = (
+    "Nothing was saved. Pass subject as lowercase letters, digits and hyphens, starting with a letter or digit, "
+    "at most 48 characters (deploy-branch), or leave it out."
+)
 # A sha256 prefix shorter than this is not an identifier a brief prints.
 DEMOTE_SHA_PREFIX_MIN_CHARS = 12
 # The most of a Hermes entry `demote` returns: enough for Hermes' `old_text`.
@@ -200,6 +208,10 @@ OMH_MEMORY_SCHEMA = {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": "capture: up to 8 short topic tags.",
+            },
+            "subject": {
+                "type": "string",
+                "description": "capture/correct: optional slug naming what the fact is about (deploy-branch).",
             },
             "scope": {
                 "type": "string",
@@ -377,6 +389,9 @@ def _capture(args: dict, kwargs: dict) -> dict[str, object]:
         return _capture_result("refused", reason="unsupported_record_type", next_action=f"Use one of: {', '.join(CAPTURE_RECORD_TYPES)}.")
     if retention not in CAPTURE_RETENTION_CLASSES:
         return _capture_result("refused", reason="unsupported_retention_class", next_action=f"Use one of: {', '.join(CAPTURE_RETENTION_CLASSES)}.")
+    subject = args.get("subject")
+    if not _subject_ok(subject):
+        return _capture_result("refused", reason="invalid_subject", next_action=SUBJECT_NEXT_ACTION)
     cwd = _session_cwd(kwargs)
     identity = resolve_project_identity(cwd) if cwd is not None else None
     in_project = identity is not None and identity.state == "resolved"
@@ -394,6 +409,7 @@ def _capture(args: dict, kwargs: dict) -> dict[str, object]:
     except ValueError as exc:  # RuntimeBindingError is a ValueError
         return _capture_result("error", reason=_safe_error_type(type(exc).__name__), next_action="Nothing was saved; this session's OMH home could not be resolved.")
     try:
+        lens = _session_lens(kwargs)
         payload = capture_project_memory_candidate(
             omh_home,
             summary,
@@ -408,6 +424,10 @@ def _capture(args: dict, kwargs: dict) -> dict[str, object]:
             scope_kind="project" if scope == "project" else "user-global",
             scope_ref=identity.identity if scope == "project" and identity is not None else None,
             tags=list(tags),
+            subject=subject or "",
+            # Hints name only records this session's own lens admits, the
+            # gates `recall` applies; with no published lens that is none.
+            hint_admits=lambda record: _in_session_scope(record, lens),
         )
     except Exception as exc:
         # In-process now, so a store fault would otherwise raise into Hermes'
@@ -418,7 +438,7 @@ def _capture(args: dict, kwargs: dict) -> dict[str, object]:
             reason=_safe_error_type(type(exc).__name__),
             next_action="Nothing is confirmed saved. Tell the user the capture failed; call action='status' to see what is held.",
         )
-    return _map_capture_payload(payload)
+    return _map_capture_payload(payload, lens)
 
 
 def _summary_refusal(summary: str, tags: object) -> tuple[str, str] | None:
@@ -436,7 +456,91 @@ def _summary_refusal(summary: str, tags: object) -> tuple[str, str] | None:
     return None
 
 
-def _map_capture_payload(payload: dict) -> dict[str, object]:
+def _subject_ok(value: object) -> bool:
+    """Absent, empty, or a slug of the closed shape recall groups by."""
+    try:
+        normalize_memory_subject(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _recallable_ids(lens: "_SessionLens") -> set[str]:
+    """Record ids an unqueried prefetch under this lens would serve, budget aside.
+
+    The selector itself decides -- scope, principal, perspective, eligibility,
+    attention tier, subject collapse -- so a hint's "recalls" or "does not
+    recall" is computed by the same code a turn runs, never assumed.
+    """
+    snapshot = read_record_store_snapshot(lens.homes)
+    selection = select_prefetch_records(
+        snapshot,
+        "",
+        allowed_scopes=lens.scopes,
+        session_id=lens.session_id,
+        executor_target=lens.executor_target,
+        limit=max(len(snapshot.records), 1),
+        principal_context=lens.principal_context,
+        shared_surface=lens.shared_surface,
+    )
+    pack = selection.pack
+    served = {str(item.get("record_id", "")) for item in pack.get("included_records", [])}
+    served |= {str(item.get("record_id", "")) for item in pack.get("excluded_records", []) if item.get("reason") == "over_budget"}
+    return served
+
+
+def _recall_clause(record_id: str, recallable: set[str] | None) -> str:
+    if recallable is None:
+        return f"whether {record_id} recalls could not be read"
+    return f"{record_id} recalls" if record_id in recallable else f"{record_id} does not recall"
+
+
+def _capture_hints(payload: dict, candidate: dict, new_id: str, lens: "_SessionLens | None") -> tuple[dict[str, object], str]:
+    """Admission's two hints as result fields, plus the sentence that says what to do.
+
+    The capture already went through either way. Whether each named record
+    recalls is computed with the selector over this session's lens after the
+    write (`_recallable_ids`), so a same-second tie on the subject, or a held
+    record that is stale, is reported as it is. For a replacement, `correct`
+    with this same summary moves the old record to history, linked to the new
+    one. Wording says "similar wording", never "the same fact": term overlap
+    cannot tell a replacement from a negation, so the model decides.
+    """
+    held_by = str(payload.get("subject_held_by", "") or "")
+    similar = str(payload.get("similar_record_id", "") or "")
+    if not held_by and not similar:
+        return {}, ""
+    try:
+        recallable: set[str] | None = _recallable_ids(lens) if lens is not None else None
+    except (OSError, ValueError):
+        recallable = None
+    involved = sorted({record_id for record_id in (new_id, held_by, similar) if record_id})
+    fields: dict[str, object] = {
+        "recalls_now": [record_id for record_id in involved if recallable is not None and record_id in recallable],
+    }
+    if held_by:
+        fields["subject_held_by"] = held_by
+    if similar:
+        fields["similar_record_id"] = similar
+        fields["similar_summary"] = str(payload.get("similar_summary", "") or "")
+        fields["similar_wording_pct"] = int(payload.get("similar_wording_pct", 0) or 0)
+    if not new_id:
+        return fields, ""
+    status = f"{_recall_clause(new_id, recallable)}, {_recall_clause(held_by or similar, recallable)}."
+    if held_by:
+        subject = str(candidate.get("subject", "") or "")
+        return fields, (
+            f"Saved. {held_by} also has subject '{subject}': {status} If this replaces it, call action='correct' with "
+            f"record_id='{held_by}' and this same summary to move it to history. If both still hold, correct one of "
+            "them with a reworded summary and a different subject."
+        )
+    return fields, (
+        f"Saved. {similar} has similar wording: {status} If this replaces it, call action='correct' with "
+        f"record_id='{similar}' and this same summary to move it to history; if both hold, nothing more is needed."
+    )
+
+
+def _map_capture_payload(payload: dict, lens: "_SessionLens | None" = None) -> dict[str, object]:
     """Translate an admission result into the tool's closed status set."""
     candidate = payload.get("candidate") if isinstance(payload.get("candidate"), dict) else {}
     record = payload.get("record") if isinstance(payload.get("record"), dict) else {}
@@ -447,6 +551,8 @@ def _map_capture_payload(payload: dict) -> dict[str, object]:
         "record_id": str(record.get("record_id", "") or "") or None,
         "admission_state": _admission_state(record),
     }
+    new_id = str(record.get("record_id", "") or "") if payload.get("auto_approved") else ""
+    hints, hint_action = _capture_hints(payload, candidate, new_id, lens)
     if not payload.get("captured"):
         reason = str(payload.get("reason", "") or "not_captured")
         if reason == "duplicate":
@@ -477,12 +583,14 @@ def _map_capture_payload(payload: dict) -> dict[str, object]:
         return _capture_result(
             "remembered",
             **fields,
+            **hints,
             display_line=_display_line("📌 OMH remembered: ", str(candidate.get("summary", "") or ""), 80),
-            next_action="Saved. Later sessions receive it when it fits their recall budget.",
+            next_action=hint_action or "Saved. Later sessions receive it when it fits their recall budget.",
         )
     return _capture_result(
         "pending_review",
         **{**fields, "admission_state": "pending_review"},
+        **hints,
         review_reason=str(payload.get("review_reason", "") or "unknown"),
         next_action=(
             "Saved as a candidate that waits for operator review (`omh memory review`). For "
@@ -769,6 +877,9 @@ def _lifecycle(action: str, args: dict, kwargs: dict) -> dict[str, object]:
             refusal = _summary_refusal(summary, [] if tags is None else tags)
             if refusal:
                 return _lifecycle_result(action, "refused", record_id=record_id, reason=refusal[0], next_action=refusal[1])
+            subject = args.get("subject")
+            if not _subject_ok(subject):
+                return _lifecycle_result(action, "refused", record_id=record_id, reason="invalid_subject", next_action=SUBJECT_NEXT_ACTION)
         reason = str(args.get("reason", "") or "").strip().lower()
         if action == "retire" and reason not in RETIRE_REASONS:
             return _lifecycle_result(action, "refused", record_id=record_id, reason="unsupported_reason", next_action=f"Pass reason as one of: {', '.join(RETIRE_REASONS)}.")
@@ -789,7 +900,7 @@ def _lifecycle(action: str, args: dict, kwargs: dict) -> dict[str, object]:
         if action == "confirm":
             return _confirm(home, record, lens)
         if action == "correct":
-            return _correct(home, record, summary, tags, lens)
+            return _correct(home, record, summary, tags, lens, subject=subject or "")
         return _retire(home, record, reason, lens)
     except Exception as exc:
         # In-process inside Hermes' tool dispatch: a store fault is an error
@@ -870,6 +981,8 @@ def _recall(args: dict, lens: _SessionLens) -> dict[str, object]:
         row = {key: item.get(key) for key in ("record_id", "record_type", "summary", "tags", "approved_at")}
         if item.get("resolution_marker"):
             row["resolution_marker"] = item["resolution_marker"]
+        if item.get("subject"):
+            row["subject"] = item["subject"]
         rows.append(row)
     if rows:
         # What this session has seen is what it may retire while it is live.
@@ -1079,14 +1192,16 @@ def _correction_carryover(record: dict, retention: str) -> dict[str, object]:
     return carried
 
 
-def _correct(home: Path, record: dict, summary: str, tags: object, lens: _SessionLens) -> dict[str, object]:
+def _correct(home: Path, record: dict, summary: str, tags: object, lens: _SessionLens, *, subject: str = "") -> dict[str, object]:
     """Admit the corrected fact like a capture, linked to the record it replaces.
 
     The candidate carries ``derived_from`` and ``correction_of`` naming the old
     record, so whichever approval admits it -- auto-safe now, or an operator's
     review later -- supersedes the old record inside that approval's store
     lock (`_supersede_corrected_record_unlocked`). Until then the old record
-    stays active: a pending correction never makes the fact vanish.
+    stays active: a pending correction never makes the fact vanish. The
+    subject is the one given, else the old record's, so a corrected value
+    stays in its subject's group.
     """
     record_id = str(record.get("record_id", ""))
     refusal = _live_record_refusal(record, datetime.now(timezone.utc))
@@ -1109,6 +1224,7 @@ def _correct(home: Path, record: dict, summary: str, tags: object, lens: _Sessio
             correction_of=record_id,
             correction_revision=record.get("revision"),
             principal_context=lens.principal_context if scope.get("kind") == "user" else None,
+            subject=subject or record_subject(record),
             **_correction_carryover(record, retention),
         )
     except ValueError as exc:
@@ -1126,10 +1242,7 @@ def _correct(home: Path, record: dict, summary: str, tags: object, lens: _Sessio
             duplicate_of = str(payload.get("duplicate_of", "") or "")
             if duplicate_of == record_id:
                 return _lifecycle_result("correct", "refused", record_id=record_id, reason="unchanged", next_action="Nothing changed; the record already says this.")
-            return _lifecycle_result(
-                "correct", "already_remembered", record_id=record_id, duplicate_of=duplicate_of,
-                next_action=f"The corrected fact is already held as {duplicate_of}; retire {record_id} with reason='superseded' if it no longer holds.",
-            )
+            return _correct_to_held(home, record, duplicate_of, summary, lens, subject=subject or record_subject(record))
         return _lifecycle_result(
             "correct",
             "refused",
@@ -1175,6 +1288,90 @@ def _correct(home: Path, record: dict, summary: str, tags: object, lens: _Sessio
         receipt_state=str(payload.get("receipt_state", "") or "") or None,
         display_line=_display_line("✏️ OMH corrected: ", str(successor.get("summary", "") or summary), 80),
         next_action=f"The old revision is kept under history/ and no longer recalls; {new_id} replaces it.",
+    )
+
+
+_RETENTION_RANK = {"volatile": 0, "standard": 1, "durable": 2}
+
+
+def _record_expiry(record: dict) -> datetime | None:
+    """A record's retention expiry, or None when it does not expire."""
+    retention = record.get("retention") if isinstance(record.get("retention"), dict) else {}
+    ttl = record.get("ttl") if isinstance(record.get("ttl"), dict) else {}
+    value = str(retention.get("expires_at", "") or ttl.get("expires_at", "") or "")
+    return _parse_utc_naive_as_utc(value) if value else None
+
+
+def _held_replacement_refusal(record: dict, held: dict, held_id: str, subject: str, lens: _SessionLens) -> str:
+    """Why the held record cannot stand in for the corrected one, or "" when it can.
+
+    Superseding into a record that cannot be served makes the fact vanish, so
+    the held record must recall under this session's lens now (eligible, not
+    archived, not itself replaced by a newer subject value), keep it at least
+    as long (retention class and expiry), and not declare a different subject
+    than the correction carries.
+    """
+    if held_id not in _recallable_ids(lens):
+        return "held_not_recallable"
+    if _RETENTION_RANK.get(_retention_class(held), -1) < _RETENTION_RANK.get(_retention_class(record), -1):
+        return "held_retention_shorter"
+    held_expiry, old_expiry = _record_expiry(held), _record_expiry(record)
+    if held_expiry is not None and (old_expiry is None or held_expiry < old_expiry):
+        return "held_expires_sooner"
+    held_subject = record_subject(held)
+    if subject and held_subject and held_subject != subject:
+        return "subject_conflict"
+    return ""
+
+
+def _correct_to_held(home: Path, record: dict, held_id: str, summary: str, lens: _SessionLens, *, subject: str = "") -> dict[str, object]:
+    """Finish a correction whose corrected text another record already holds.
+
+    This is the step capture's subject and similar-wording hints point at: the
+    new fact was saved first, so correcting the old record to that same text
+    meets it in admission's duplicate check, which looks only inside the old
+    record's own confinement. When the held record can stand in
+    (`_held_replacement_refusal`), it is the replacement: the old revision
+    moves to ``history/`` with ``superseded_by`` naming it, under the store
+    lock, pinned to the revision this call read, and the correction's subject
+    is written onto the held record when it has none. Nothing new is captured.
+    Otherwise nothing changes and the result says which record holds the text.
+    """
+    record_id = str(record.get("record_id", ""))
+    held, error = read_json_object_result(memory_record_path(home, held_id))
+    refusal = "record_absent" if error or not isinstance(held, dict) else _held_replacement_refusal(record, held, held_id, subject, lens)
+    if refusal:
+        return _lifecycle_result(
+            "correct", "already_remembered", record_id=record_id, duplicate_of=held_id, supersede_skipped=refusal,
+            next_action=f"The corrected fact is already held as {held_id}; retire {record_id} with reason='superseded' if it no longer holds.",
+        )
+    stamp = utc_now()
+    with memory_store_lock(memory_index_path(home)):
+        successor, error = read_json_object_result(memory_record_path(home, held_id))
+        if error or not isinstance(successor, dict):
+            supersession: dict[str, str] = {"state": "skipped", "reason": "record_absent"}
+        else:
+            supersession = _supersede_corrected_record_unlocked(home, record_id, successor, stamp=stamp, revision=record.get("revision"))
+            if supersession.get("state") == "superseded":
+                if subject and not record_subject(successor):
+                    # Not part of the payload digest, so the review linkage stands.
+                    successor = {**successor, "subject": subject}
+                    write_project_memory_record(home, successor)
+                write_memory_index_unlocked(home, updated_at=stamp)
+    if supersession.get("state") != "superseded":
+        return _lifecycle_result(
+            "correct", "already_remembered", record_id=record_id, duplicate_of=held_id,
+            supersede_skipped=str(supersession.get("reason", "") or "unknown"),
+            next_action=f"The corrected fact is already held as {held_id}; {record_id} was not changed.",
+        )
+    return _lifecycle_result(
+        "correct",
+        "corrected",
+        record_id=held_id,
+        superseded_record_id=record_id,
+        replacement="already_held",
+        display_line=_display_line("✏️ OMH corrected: ", str(successor.get("summary", "") or summary), 80),
+        next_action=f"{held_id} already said this and now replaces {record_id}; the old revision is kept under history/ and no longer recalls.",
     )
 
 

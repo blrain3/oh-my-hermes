@@ -254,7 +254,17 @@ SKILL_INDEX_LINE_CHAR_LIMIT = 100
 # carry no descriptions the sentence already gives, and `summary`/`tags` keep
 # their capture-only glosses. Owner rule 2026-10-06. Re-derived from the
 # producer.
-PLUGIN_TOOL_SCHEMA_CHAR_LIMIT = 64031
+# 64031 -> 64158: `omh_memory` gains the optional `subject` parameter (127
+# with its gloss), the slug capture and correct store so recall serves only
+# the newest record per scope and subject. The gloss says only what it names;
+# what recall does with it rides the capture result's computed `next_action`,
+# read where it applies. A first revision dropped the capture status list
+# from the description to make room; review of #2091 asked for it back,
+# because it is what the model reads at the call to know how to report a
+# capture, so it stays and the subject gloss was shortened instead. The
+# capture hints (`subject_held_by`, `similar_record_id`) add no schema text.
+# Re-derived from the producer.
+PLUGIN_TOOL_SCHEMA_CHAR_LIMIT = 64158
 # PRE_LLM_CALL_CONTEXT_CHAR_LIMIT, PRE_LLM_CALL_CONTEXT_FALLBACK_CHAR_LIMIT: moved with
 # their history to src/plugin_bundle/omh/turn_budget.py; imported at the top of this file.
 # 340000 -> 349637: three capability-skill sections were added by the domain

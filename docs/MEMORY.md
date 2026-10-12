@@ -394,7 +394,7 @@ Hermes writes into this store itself, with no operator step in the normal
 loop. When the user states a lasting preference, a decision, a fact about
 their setup or project, or a lesson, the model calls
 `omh_memory(action="capture", summary=..., record_type=..., tags=...,
-scope=..., retention_class=...)`. The tool calls memory admission in-process
+scope=..., retention_class=..., subject=...)`. The tool calls memory admission in-process
 (`memory_admission` in the plugin bundle, the same path `omh memory capture`
 reaches through its adapters), with duplicates skipped, and maps the result to
 one `status`:
@@ -404,8 +404,68 @@ one `status`:
 | `remembered` | Auto-safe approval ran; `receipt_state` says how far the write was observed, `replay_ready` only when admission's own replay evaluation cleared it. |
 | `pending_review` | A candidate was persisted and held; `review_reason` is `unsafe_content`, `relative_time_phrase`, `duplicate`, `derived_content`, or `policy_review_first`. |
 | `already_remembered` | A live record has the same normalized summary; `duplicate_of` names it and nothing was written. |
-| `refused` | Nothing was written: invalid input, memory turned off, a project scope this session cannot resolve, or an `instruction_shaped_summary` (a second-person order or a Korean request ending, outside `procedure` records), whose `next_action` asks for the fact restated as an observation. |
+| `refused` | Nothing was written: invalid input (including an `invalid_subject`), memory turned off, a project scope this session cannot resolve, or an `instruction_shaped_summary` (a second-person order or a Korean request ending, outside `procedure` records), whose `next_action` asks for the fact restated as an observation. |
 | `error` | Admission raised (an unreadable store, a lock held past its 10 s wait); `reason` names the exception class and nothing is confirmed saved. |
+
+`subject` is optional: a short slug the model chooses for what the fact is
+about (`deploy-branch`, `reply-language`), in the closed shape
+`[a-z0-9][a-z0-9-]{0,47}`. Anything else is refused as `invalid_subject`, never
+rewritten to fit. It is stored on the candidate, shown on its review card, and
+copied onto the record. Recall serves only the newest approved record per
+scope and subject (see Recall Ranking and Delivery Usage).
+
+Version skew: a record carrying `subject` is unreadable to an OMH build from
+before this field. That build's record validator refuses unknown keys, so it
+skips the record (reported as unreadable) until it updates; nothing is
+rewritten and the record comes back on the next read by a current build.
+There is no schema bump: a new record schema would make the older build skip
+every new record, not only the ones that declare a subject.
+
+A capture that goes through can carry two hints. They are read inside the
+capture's own confinement, the same set the duplicate check uses: the same
+scope, the same subject principal, and for a record shared with an explicit
+principal audience, the same audience. Within that, a hint can only name a
+record the calling session's own lens admits. The tool passes the lens the
+memory provider published (the principal, scope and perspective gates
+`recall` applies, with the shared-surface verdict), so on a shared surface a
+record the lens refuses never comes back through a capture result, by id or
+by summary. With no published lens there are no hints. A summary that
+redacted to `[redacted]` never matches anything, for hints or duplicates.
+
+- `subject_held_by` names the newest record there that already declares the
+  same subject, by recall's own rule (`newest_record`).
+- `similar_record_id`, `similar_summary` and `similar_wording_pct` name the
+  record whose wording is closest, when the two summaries share at least
+  `SIMILAR_WORDING_JACCARD_PCT` (60) percent of their distinct stemmed terms
+  (token Jaccard, compared in integers).
+- `recalls_now` lists which of the new record and the named one an unqueried
+  prefetch under the session's lens serves after the write. It is computed by
+  running the selector, so a same-second tie on a subject (approval stamps
+  whole seconds, and the smaller record id wins) or a held record that is
+  stale is reported as it is. The `next_action` sentence is built from it.
+
+Neither hint holds or refuses the capture: refusing a capture that only
+resembles a held record would lose the new fact whenever the resemblance is
+wrong. Neither decides that two records state the same fact. A negation
+shares nearly every term with what it negates, and a subject is only a label
+the model chose. For a `remembered` capture, `next_action` asks the model to
+call `correct` on the named record with the same summary if the new fact
+replaces it. That moves the old record to history, linked to the new one (see
+`correct` below). The record a correction replaces, and an exact duplicate,
+are never named as hints.
+
+Hints and recall group a subject differently on purpose. A hint names only a
+live record in the capture's confinement, because its only use is a `correct`
+that acts on it. Recall's collapse groups every record still in the store
+that its lens admits, expired, stale and archived ones included, so an older
+value cannot come back when the newest one lapses.
+
+The subject hint does not route to supersession automatically. A slug is the
+model's own label, and two different facts can land on one by accident.
+Automatic supersession would move a still-true record to history on a naming
+slip, while the recall-side rule already keeps the older value out of every
+pack and destroys nothing. The explicit `correct` keeps the revision pin and
+the lineage link.
 
 `scope` defaults to `project` when the session's working directory resolves a
 project identity, and to `user` otherwise; `user` is stored as the
@@ -465,9 +525,9 @@ them writes anything.
 
 | Action | Arguments | What it does | `status` values |
 | --- | --- | --- | --- |
-| `recall` | `query`, optional `limit` (1-6) | Runs the prefetch selector over the lens's homes, allowlist, and principal, so the order is the order a prefetch for that query serves. Returns record ids, summaries, types, tags, approval dates. Counts no use; the returned ids join the session's seen list. | `found`, `nothing_found`, `refused`, `error` |
+| `recall` | `query`, optional `limit` (1-6) | Runs the prefetch selector over the lens's homes, allowlist, and principal, so the order is the order a prefetch for that query serves. Returns record ids, summaries, types, tags, approval dates, and the subject when a record declares one. Counts no use; the returned ids join the session's seen list. | `found`, `nothing_found`, `refused`, `error` |
 | `confirm` | `record_id` | `omh memory confirm`'s rewrite: the review deadline moves to the record's stored cadence (else the policy default, else 90 days), an open record is answered `resolved`, and `revalidation.confirmed_by` is `hermes_model`. Then one `used` count, at most once per record per session. A record with no review deadline (a durable capture) is not refused; only the use is counted. Expired, superseded, and source-changed records are refused like the operator verb. | `confirmed`, `refused`, `error` |
-| `correct` | `record_id`, `summary`, optional `tags` | Admits the corrected fact through the model capture gates (instruction-shaped refusal, safety, relative-time review). The new record keeps the old record's type, scope, retention, perspective, cited source, review cadence day count, TTL day count, and tags unless new tags are given. The candidate carries `derived_from: [<old id>]`, `correction_of: <old id>`, and `correction_of_revision`, the revision the model read. Whichever approval admits it supersedes the old record inside its store lock: auto-safe at once, or an operator's `omh memory approve` later. If the old record was rewritten to another revision in between, nothing is superseded and the approval reports `revision_moved`. The old revision moves to `history/<record-id>.r<revision>.json` with `superseded_by`, leaves `records/`, and its source candidate becomes `superseded`, which approval refuses. Until then the old record stays active. | `corrected`, `pending_review`, `already_remembered`, `refused`, `error` |
+| `correct` | `record_id`, `summary`, optional `tags`, optional `subject` | Admits the corrected fact through the model capture gates (instruction-shaped refusal, safety, relative-time review). The new record keeps the old record's type, scope, retention, perspective, cited source, review cadence day count, TTL day count, subject, and tags unless new tags or a new subject are given. The candidate carries `derived_from: [<old id>]`, `correction_of: <old id>`, and `correction_of_revision`, the revision the model read. Whichever approval admits it supersedes the old record inside its store lock: auto-safe at once, or an operator's `omh memory approve` later. If the old record was rewritten to another revision in between, nothing is superseded and the approval reports `revision_moved`. The old revision moves to `history/<record-id>.r<revision>.json` with `superseded_by`, leaves `records/`, and its source candidate becomes `superseded`, which approval refuses. Until then the old record stays active. When the corrected summary is already held as another record in the old record's scope and principal, which is what happens after a capture hint, that record is the replacement, if it can stand in: it must recall under the session's lens now (eligible, not archived, not itself replaced by a newer subject value), keep the fact at least as long (retention class and expiry), and not declare a different subject than the correction carries. Then the old revision moves to history with `superseded_by` naming it, under the store lock and pinned to the revision read; the correction's subject is written onto the held record when it has none; the result says `replacement: already_held`; and nothing new is captured. Otherwise nothing changes, and the result is `already_remembered` with `supersede_skipped` naming why (`held_not_recallable`, `held_retention_shorter`, `held_expires_sooner`, `subject_conflict`, `record_absent`, or a supersession skip such as `revision_moved`). | `corrected`, `pending_review`, `already_remembered`, `refused`, `error` |
 | `retire` | `record_id`, `reason` (`no_longer_true`, `superseded`, `user_asked`) | `omh memory retire --apply`'s move for one record: `records/` to `archive/<record-id>.<stamp>.json`, a `retirements.jsonl` line carrying the reason, `retired_by: hermes_model`, and the `session_id`, and the source candidate flipped to `retired`. Never a delete; `omh memory restore` finds the archived revision and brings it back through review. Unlike the operator verb it may retire a record that has not expired, but only one this session was served or recalled; an unseen live record is refused as `record_not_seen_this_session`. That rule is not a defence against a model told to retire something, since a recall adds the id. What it guarantees is narrower: no blind retire of an id the conversation never saw, attribution to the session in the journal, and an archive that can always be restored. If a step after the archive move fails, the result says the record was archived. | `retired`, `refused`, `error` |
 
 `correct` and `retire` return a suggested `display_line` (`✏️ OMH corrected:
@@ -798,16 +858,143 @@ more than half of `open_max_days`.
 
 ## Recall Ranking and Delivery Usage
 
-Recall packs order eligible records relevance-first: keyword relevance rank
-(term and tag overlap) is the primary sort key, and deterministic reciprocal
-rank fusion over relevance, recency (`approved_at`), and delivery usage
-orders records that share a relevance rank. A weaker keyword match can never
+Recall packs order eligible records relevance-first: the relevance rank
+(query-term coverage, then BM25) is the primary sort key, and deterministic
+reciprocal rank fusion over
+relevance, recency (`approved_at`), and delivery usage orders records that
+share a relevance rank. A weaker keyword match can never
 displace a stronger one, including across the budget cut; without a query all
 relevance ties and recency plus usage decide the order. Each included record
 carries a `ranking` block with its per-signal ranks and an integer
 `rrf_score_micro`, so the order is always explainable from the pack itself.
 The usage signal ranks on saturating buckets (0, 1-2, 3-9, 10+ deliveries) so
 delivery counts cannot compound into a permanent head start.
+
+Relevance is BM25 (k1 1.2, b 0.75) computed against the eligible candidates of
+that one selection, so document frequencies and the average summary length
+come from the store being recalled from and the same store and query always
+score the same:
+
+- A word most records share weighs little and a word one record holds weighs
+  a lot. The old score counted every shared word alike, so a chat message
+  sharing "the plan for" with an offsite note outranked the one record about
+  the backup it asked about.
+- Coverage comes before BM25. It is twice the number of distinct query terms
+  a record matches in its summary or tags, plus one for each matched term
+  that is one of its tags (the old overlap scorer's shape, without the record
+  type). BM25 only orders records of equal coverage, and the ranking block
+  reports `coverage`. Rarity alone is unbounded: in a store of statements, a
+  chat word the lists below miss is held by one record and outweighs a topic
+  word several records share. In the review's 2,000-record probe, a record
+  matching only "remind" scored 6349 against 4701 for a deploy record whose
+  summary and tag both matched. Under coverage, the topic word plus its tag outranks any
+  single stray word, however rare.
+- The query loses its function words first. The lists are closed and only
+  the query is filtered; records keep every word:
+  - English interrogatives, auxiliaries, pronouns, articles and common
+    prepositions (`_QUERY_FUNCTION_WORDS`);
+  - chat fillers such as remind, quick, question, anyone, tell and know
+    (`_QUERY_CHAT_FILLERS`);
+  - Korean bare verb endings matched as whole runs (`_QUERY_FUNCTION_RUNS`);
+  - any Korean run that starts with an interrogative (언제, 어떻게, 누가, 누구,
+    어디, 뭐, 무슨, 몇, 왜; `_QUERY_FUNCTION_RUN_PREFIXES`), so 언제쯤이야 and
+    누가요 go too;
+  - Japanese and Chinese interrogatives (どう, 何, いつ, 誰, 怎么, 什么, 谁 ...;
+    `_QUERY_FUNCTION_CJK`), cut out of a run before it is split into bigrams.
+
+  Records are statements, so these words are rare in a store and idf made
+  them the heaviest words in the question: "how do we deploy?" ranked "How
+  expenses are filed ..." above every deploy record. A listed word still
+  scores when it is the only term left ("what is it?" is scored on "what"),
+  or when the raw query writes it all in capitals or capitalized
+  mid-sentence ("WHO?", "ask Will", "CAN logger"). Both checks read the raw
+  string before lowercasing. A word not listed scores normally, and that is
+  what coverage is for.
+- How the two halves were chosen (the review of #2091's fresh probes,
+  holdout-2):
+  - With the earlier lists, coverage alone fixed the English cases but not
+    the Korean, Japanese or Chinese ones, where a stray bigram and a topic
+    bigram both count once and no English tag helps.
+  - With the closed lists and no coverage, the Japanese case still put
+    "どうやるのか分からない時は..." above the deploy record, on its leftover
+    bigrams.
+  - Together they held every case.
+  - A binary tag-match flag measured the same as the per-tag count; an idf
+    cap relative to the best tag-matched term kept the Japanese miss.
+- There are three fields. A summary hit is the unit and a tag hit weighs 2;
+  the weighted counts saturate together, so a word in both the summary and a
+  tag outranks a tag-only hit, which outranks a summary-only hit. The record
+  type weighs like one summary word, but only in a record that also has a
+  summary or tag hit: a type is a category, so "any facts about deploys?"
+  does not pull in every fact record.
+- Summary length is counted in whole multiples of the candidates' average,
+  never below one, rather than as a continuous ratio. Two near-average records
+  that cover the same query terms therefore tie, and recency and usage still
+  decide them. A record at least twice the average is discounted, so a long
+  checklist that mentions a word once ranks below the short record about it.
+  The step is a cliff: a record at 1.99 times the average is not discounted,
+  and adding short records lowers the average and can push a long record
+  across it. CJK summaries count their runs and bigrams, so they read longer
+  than English ones of the same meaning. Both effects only reorder records
+  whose other evidence ties.
+- Each term's contribution is rounded to integer millionths before it is
+  added and the score is stored as integer thousandths, so ties are exact and
+  the total cannot depend on summation order, the hash seed or the host's
+  float rounding.
+- A temporal query (see Recall signal refinements) ranks relevance in four
+  bands below the best score of the same coverage instead of on raw scores,
+  so records within a quarter of the best compete on recency (weighted up for
+  that query). BM25
+  thousandths are nearly a total order, and without the bands "what did we
+  decide recently about deploy windows" served the older decision first
+  because it repeated "deploy".
+
+Tokens are the same ASCII words, two-letter terms, CJK runs with character
+bigrams, and accent-folded Latin words as before. Each all-ASCII-letter token
+of four or more letters is then lightly stemmed, the same way for the query
+and the records: one plural rule, at most one of -ment, -ing, -ion, -ed and
+-ly, then a final e. Deploy, deploys, deployed, deploying and deployment all
+meet, as do cache, caches and caching. A suffix comes off only when it leaves
+a stem with a vowel and a minimum length, which keeps string, thing, apply,
+reply and region whole. CJK runs, accented words, numbers, paths, and
+hyphenated or underscored compounds are never stemmed. It is a stemmer, not a
+dictionary: state, stats, station and statement all read as "stat", likely as
+like, evening as even, news as new.
+
+So a match made only by stemming is weaker evidence. It counts as overlap
+only when some live candidate in the same selection also shares an unstemmed
+query token in its summary or tags. When none does, the query met the store
+only through a suffix rule, and it falls back to the active tier exactly as a
+query that matches nothing does. The stemmed matches keep their scores, so
+they lead that fallback pack, and `query_fallback` is set. "stats location?"
+therefore serves every active record with "State is kept in a Redux store"
+first, rather than serving it alone. When some record does share an unstemmed
+word, stemmed matches count normally: "new hire onboarding" still serves the
+release-news record after "New hires ...", and the recall suite pins that
+cost. A relevance score of 0 means no query term matched and any match
+scores at least 1.
+
+A record can declare a `subject` (see The model-driven loop). Two records in
+one scope that declare the same subject are two values of one thing. The
+newest `approved_at` among every record still in the store that the lens
+admits is current (the smaller record id on an equal stamp, `newest_record`).
+That includes expired, stale and archived records, so an older value cannot
+come back when the newest one lapses: the subject still says it was replaced,
+and the topic simply has no servable value until it is confirmed, corrected
+or restored. Each other eligible record is excluded as
+`superseded_by_subject`, with `superseded_by` naming the current record and
+`subject` naming the slug. The prefetch receipt lists those id pairs under
+`selection.subject_superseded` (at most 16; the count in
+`exclusion_reason_counts` is never cut).
+
+The current record takes the best coverage and relevance score in its group
+only when it shares a query term itself. A query worded like the old value still finds a
+current value that shares some of its words. A current value that matches
+nothing is never pulled in on another record's words, because two different
+facts given one slug by mistake must not serve the unrelated one. The collapse
+reads two structured fields and never the summaries. A record with no subject
+never joins a group, different scopes never merge, and a pin does not hold an
+older value in place.
 
 A query that matches nothing does not empty the pack. When a query has
 indexable tokens and no eligible record overlaps it and no pin applies, every
@@ -896,7 +1083,9 @@ records of equal relevance.
 lowercase, collapsed whitespace) against active records and stamps an exact
 match as `duplicate_of` on the candidate and its review card. Review-first:
 nothing is silently merged, the reviewer decides — but a duplicate never
-auto-approves, even under the auto-safe policy.
+auto-approves, even under the auto-safe policy. Wording that is only similar
+is a hint on the capture result (`similar_record_id`), never a duplicate: see
+The model-driven loop.
 
 **Episode rollup** — additive consolidation without a model:
 
@@ -1765,7 +1954,24 @@ The corpus covers exact and partial relevance, no-match behavior, same-topic
 disagreement, correction and supersession, expiry, stale review and the
 `--include-stale` inspection path, scope and perspective isolation, pin and
 attention interactions, age ties, both archive directions, and record and
-character budget truncation.
+character budget truncation. It also covers inflected query words (deployment,
+migration, caching), tag-only matches, a long record that mentions a word in
+passing beside a short record about it, Korean, Chinese, Japanese and
+mixed-language queries, common words that must not outrank a rare match, and
+same-subject supersession in one scope and across scopes. The stores and
+queries the review of #2091 used against the first BM25 revision are copied
+in verbatim: question words that must not lead, stemmed-only matches that
+must fall back, a temporal query that must keep recency, a plural record-type
+word that must not flood the pack, and a superseded subject value that must
+not come back when the newest expires or is archived. The re-review's
+question-shaped stores are copied the same way: Japanese, Chinese, Korean
+and English questions whose wrapping words must not outrank the deploy
+records, and "WHO?", "ask Will" and "CAN logger", where a listed word in
+capitals names something. Cases whose answer is a known cost say so in their
+intent: the light stemmer reads "news" as "new"
+when another record matches "new" exactly, "caching" alone falls back
+because its only match is stemmed, and a current subject value that shares no
+query word arrives only through the fallback.
 
 The clock is part of the fixture. Every timestamp is absolute and the corpus
 declares its own `now`, so a case that turns on expiry, review deadlines, or

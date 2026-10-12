@@ -30,7 +30,7 @@ import json
 import os
 from pathlib import Path
 import re
-from typing import Any
+from typing import Any, Callable
 import unicodedata
 
 from .hermes_memory import classify_record_expiry as _classify_record_expiry
@@ -72,7 +72,11 @@ from .memory_recall_support import (
     _redacted_metadata_label,
     _scope,
     _string_list,
+    memory_summary_terms,
+    newest_record,
+    normalize_memory_subject,
     normalized_summary_key,
+    record_subject,
 )
 from .awareness_delivery import _with_windows_retry
 from .memory_store_io import (
@@ -127,6 +131,15 @@ PROJECT_MEMORY_RECORD_TYPES = ("fact", "decision", "lesson", "procedure", "episo
 CAPTURE_ON_DUPLICATE_CHOICES = ("candidate", "skip")
 _MEMORY_ATTENTION_REASON_LIMIT = 240
 _DERIVED_FROM_LIMIT = 8
+# Capture names a held record whose summary shares at least this share of the
+# two summaries' distinct stemmed terms (token Jaccard, in percent, compared in
+# integers). A changed value in an otherwise repeated sentence ("The staging
+# database runs postgres 16" -> "... 17") scores 71; two different facts about
+# one topic ("Staging deploys run canary batches before promotion" / "Staging
+# deploys wait for a green nightly run") score 27. It is a hint about wording only: a
+# negation shares nearly every term with the fact it negates, so it never
+# decides that two records state the same fact, and the capture is never held.
+SIMILAR_WORDING_JACCARD_PCT = 60
 
 
 def build_project_memory_policy(omh_home: Path, *, mode: str | None = None, mode_source: str = "default") -> dict[str, object]:
@@ -245,10 +258,13 @@ def capture_project_memory_candidate(
     on_duplicate: str = "candidate",
     correction_of: str = "",
     correction_revision: int | None = None,
+    subject: str = "",
+    hint_admits: Callable[[dict[str, Any]], bool] | None = None,
     clock: Clock = utc_now,
     lock: StoreLock = memory_store_lock,
 ) -> dict[str, object]:
     omh_home = Path(omh_home)
+    subject = normalize_memory_subject(subject)
     if on_duplicate not in CAPTURE_ON_DUPLICATE_CHOICES:
         raise ValueError(f"unsupported on_duplicate: {on_duplicate}; expected one of {', '.join(CAPTURE_ON_DUPLICATE_CHOICES)}")
     policy = read_project_memory_policy(omh_home)
@@ -274,6 +290,7 @@ def capture_project_memory_candidate(
         str(expires_at or ""),
         str(observer or ""),
         str(observed or ""),
+        subject,
     ]
     if isinstance(derived_from, (list, tuple)):
         structural_values.extend(str(ref) for ref in derived_from)
@@ -404,6 +421,8 @@ def capture_project_memory_candidate(
         # Pinned so a later approval supersedes only the revision the model
         # read, never one rewritten in between.
         candidate["correction_of_revision"] = correction_revision
+    if subject:
+        candidate["subject"] = subject
     if parsed_principal is not None and (scope_kind == "user" or audience_principals):
         candidate["schema_version"] = "project_memory_candidate/v2"
         candidate["identity"] = build_memory_identity(
@@ -425,6 +444,7 @@ def capture_project_memory_candidate(
     # `approve_project_memory_candidate` is a different file, so holding this
     # one across the call is not a re-entry.
     with lock(memory_capture_lock_path(omh_home)):
+        confined = _records_in_confinement(omh_home, candidate)
         if on_duplicate == "skip":
             # The model-driven capture path: a candidate stamped duplicate_of
             # would wait for a reviewer who is not in that loop, so it names the
@@ -434,7 +454,7 @@ def capture_project_memory_candidate(
             # nothing is persisted, and a match in another project or for another
             # principal would never be recalled under this lens, so it is not
             # "already remembered" and the capture goes through.
-            duplicate_of = _duplicate_held_in_confinement(omh_home, candidate)
+            duplicate_of = _duplicate_in(confined, candidate)
         else:
             duplicate_of = _find_duplicate_record(omh_home, str(candidate.get("summary", "")))
         if duplicate_of and on_duplicate == "skip":
@@ -454,6 +474,20 @@ def capture_project_memory_candidate(
             }
         if duplicate_of:
             candidate["duplicate_of"] = duplicate_of
+        # Two hints, never a refusal: refusing a capture that resembles a held
+        # record would lose the new fact whenever the resemblance is wrong. The
+        # record this capture corrects (derived_from) and the exact duplicate
+        # are not hints. Both read structured values -- a declared subject, a
+        # set of stemmed terms -- and neither decides that two records state
+        # the same fact; the model does, with `correct`.
+        # A caller acting for a session passes its lens as `hint_admits`, so a
+        # hint can only name a record that session could recall itself: on a
+        # shared surface a record the lens refuses must not come back through
+        # a capture result, id or summary.
+        not_a_hint = {*_string_list(candidate.get("derived_from", [])), duplicate_of}
+        hintable = [record for record in confined if hint_admits is None or hint_admits(record)]
+        subject_held_by = _subject_holder(hintable, subject, skip=not_a_hint) if subject else ""
+        similar = _similar_wording(hintable, str(candidate.get("summary", "")), skip=not_a_hint)
         # Relative-time prose is detected on the summary as it will be STORED
         # (post-redaction), because that is the text that will lie later. The
         # verdict rides on the candidate for the review card, and it suppresses
@@ -509,6 +543,16 @@ def capture_project_memory_candidate(
         "receipt_state": _capture_receipt_state(omh_home, record),
         **({"review_reason": review_reason} if review_reason else {}),
         **({"supersession": supersession} if supersession else {}),
+        **({"subject_held_by": subject_held_by} if subject_held_by else {}),
+        **(
+            {
+                "similar_record_id": similar[0],
+                "similar_summary": similar[1],
+                "similar_wording_pct": similar[2],
+            }
+            if similar[0]
+            else {}
+        ),
         "capture_receipt": {
             "schema_version": "memory_capture_receipt/v1",
             "subject_principal": candidate.get("identity", {}).get("subject_principal") if isinstance(candidate.get("identity"), dict) else None,
@@ -638,6 +682,9 @@ def _project_memory_review_card_projection(candidate: dict[str, Any]) -> dict[st
         "scope": _normalize_scope(candidate.get("scope", _scope("project", "default"))),
         "tags": _string_list(candidate.get("tags", [])),
         "created_at": str(candidate.get("created_at", "")),
+        # Approval stores it and recall groups by it, so a reviewer sees it
+        # and the review revision binds it.
+        **({"subject": subject} if (subject := record_subject(candidate)) else {}),
         **({"duplicate_of": str(candidate["duplicate_of"])} if candidate.get("duplicate_of") else {}),
         **(
             {"time_sensitivity": candidate["time_sensitivity"]}
@@ -850,7 +897,7 @@ def _find_duplicate_record(omh_home: Path, summary: str, *, now: datetime | None
     same fact": recall's `duplicate_record` reads the same key function.
     """
     key = normalized_summary_key(summary)
-    if not key:
+    if not _matchable_summary_key(key):
         return ""
     now = now if now is not None else datetime.now(timezone.utc)
     for record in read_project_memory_records(omh_home):
@@ -861,31 +908,106 @@ def _find_duplicate_record(omh_home: Path, summary: str, *, now: datetime | None
     return ""
 
 
-def _duplicate_held_in_confinement(omh_home: Path, candidate: dict[str, object], *, now: datetime | None = None) -> str:
-    """Record id of a non-expired same-summary record in the candidate's own scope and principal.
+def _matchable_summary_key(key: str) -> bool:
+    """False for an empty summary and for one redaction replaced whole.
+
+    Two different secrets both store as "[redacted]"; matching them would
+    call the second one a duplicate (and skip it) or a similar wording of the
+    first, so a fully redacted summary never matches anything.
+    """
+    return bool(key) and key != "[redacted]"
+
+
+def _records_in_confinement(omh_home: Path, candidate: dict[str, object], *, now: datetime | None = None) -> list[dict[str, Any]]:
+    """Non-expired records in the candidate's own confinement, in store order.
 
     The cross-scope match `_find_duplicate_record` returns is a reviewer's
     hint; it is the wrong answer for a path that persists nothing on a match,
     because a record confined to another project or another principal is
-    never recalled under this candidate's lens. Same scope (kind and ref) and
-    same subject principal (both absent, or equal) is what "held" means here.
+    never recalled under this candidate's lens. Same scope (kind and ref), same
+    subject principal (both absent, or equal) and, for records shared with an
+    explicit principal audience, the same audience: a fact shared with one
+    group is not "held" for a capture addressed to another. The capture hints
+    read the same set.
+
+    Recall's subject collapse groups differently on purpose: it groups every
+    record still in the store that its lens admits, expired ones included, so
+    an older value cannot resurface when the newest expires. A hint names only
+    a live record, because its only use is a `correct` that acts on it.
     """
-    key = normalized_summary_key(str(candidate.get("summary", "")))
-    if not key:
-        return ""
     now = now if now is not None else datetime.now(timezone.utc)
     scope = candidate.get("scope") if isinstance(candidate.get("scope"), dict) else {}
     principal = _subject_principal(candidate)
+    audience = _audience_key(candidate)
+    confined: list[dict[str, Any]] = []
     for record in read_project_memory_records(omh_home):
         if _classify_record_expiry(record, now=now) == "expired":
             continue
-        if normalized_summary_key(str(record.get("summary", ""))) != key:
-            continue
         record_scope = record.get("scope") if isinstance(record.get("scope"), dict) else {}
-        if record_scope != scope or _subject_principal(record) != principal:
+        if record_scope != scope or _subject_principal(record) != principal or _audience_key(record) != audience:
             continue
-        return str(record.get("record_id", ""))
+        confined.append(record)
+    return confined
+
+
+def _audience_key(artifact: dict[str, object]) -> tuple[str, tuple[str, ...]] | None:
+    """(audience kind, sorted principal refs) of an identity-bound artifact, else None."""
+    identity = artifact.get("identity")
+    audience = identity.get("audience") if isinstance(identity, dict) else None
+    if not isinstance(audience, dict):
+        return None
+    refs = audience.get("principal_refs")
+    return (str(audience.get("kind", "")), tuple(sorted(str(ref) for ref in refs)) if isinstance(refs, list) else ())
+
+
+def _duplicate_in(confined: list[dict[str, Any]], candidate: dict[str, object]) -> str:
+    """Record id of the first confined record with the candidate's normalized summary, or ""."""
+    key = normalized_summary_key(str(candidate.get("summary", "")))
+    if not _matchable_summary_key(key):
+        return ""
+    for record in confined:
+        if normalized_summary_key(str(record.get("summary", ""))) == key:
+            return str(record.get("record_id", ""))
     return ""
+
+
+def _subject_holder(confined: list[dict[str, Any]], subject: str, *, skip: set[str]) -> str:
+    """The newest confined record already declaring this subject, or "" (recall's own rule)."""
+    holders = [
+        record
+        for record in confined
+        if record_subject(record) == subject and str(record.get("record_id", "")) not in skip
+    ]
+    return str(newest_record(holders).get("record_id", "")) if holders else ""
+
+
+def _similar_wording(confined: list[dict[str, Any]], summary: str, *, skip: set[str]) -> tuple[str, str, int]:
+    """(record id, summary, Jaccard percent) of the confined record worded most like this summary.
+
+    ("", "", 0) when no record reaches `SIMILAR_WORDING_JACCARD_PCT`. Terms are
+    the stemmed index terms recall ranks with, compared as sets; the ratio is
+    compared in integers, the highest wins, then the newest record.
+    """
+    terms = memory_summary_terms(summary)
+    if not terms or not _matchable_summary_key(normalized_summary_key(summary)):
+        return "", "", 0
+    best: tuple[int, int] = (0, 1)
+    matches: list[dict[str, Any]] = []
+    for record in confined:
+        if str(record.get("record_id", "")) in skip or not _matchable_summary_key(normalized_summary_key(str(record.get("summary", "")))):
+            continue
+        other = memory_summary_terms(str(record.get("summary", "")))
+        shared, union = len(terms & other), len(terms | other)
+        if shared * 100 < union * SIMILAR_WORDING_JACCARD_PCT:
+            continue
+        if shared * best[1] > best[0] * union:
+            best, matches = (shared, union), [record]
+        elif shared * best[1] == best[0] * union:
+            matches.append(record)
+    if not matches:
+        return "", "", 0
+    kept = newest_record(matches)
+    return str(kept.get("record_id", "")), _redact_admitted_text(str(kept.get("summary", "")))[:160], best[0] * 100 // best[1]
 
 
 def _subject_principal(artifact: dict[str, object]) -> str | None:
@@ -1200,6 +1322,7 @@ def _record_from_candidate(
         "summary": _redact_admitted_text(str(candidate.get("summary", "")))[:500],
         "scope": scope,
         "tags": _normalize_tags(candidate.get("tags", [])),
+        **({"subject": subject} if (subject := record_subject(candidate)) else {}),
         "source": _redact_admitted_text(str(candidate.get("source", "cli"))),
         "source_class": "omh_local",
         "source_ref": _redact_admitted_text(str(candidate.get("source_ref", "")))[:160],

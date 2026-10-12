@@ -40,6 +40,9 @@ _HEX64 = frozenset("0123456789abcdef")
 _UNSIGNED_KEYS = frozenset({"receipt_id", "state", "served_at"})
 # Basenames of unreadable store files the receipt names; the count is never cut.
 MAX_UNREADABLE_NAMES = 16
+# Records a newer same-subject record replaced, named by id; the count in
+# `exclusion_reason_counts` is never cut.
+MAX_SUBJECT_SUPERSEDED = 16
 
 
 def build_prefetch_receipt(
@@ -122,6 +125,13 @@ def build_prefetch_receipt(
             # it; the receipt keeps a fixed shape and says null otherwise.
             "query_fallback": dict(pack["query_fallback"]) if isinstance(pack.get("query_fallback"), dict) else None,
             "exclusion_reason_counts": {str(key): int(value) for key, value in sorted(selection.exclusion_reason_counts.items())},
+            # Which record stood in for which: a count alone cannot answer
+            # "why did the old value not come back?". Ids only.
+            "subject_superseded": [
+                {"record_id": str(item.get("record_id", "")), "superseded_by": str(item.get("superseded_by", ""))}
+                for item in pack.get("excluded_records", [])
+                if isinstance(item, dict) and item.get("reason") == "superseded_by_subject"
+            ][:MAX_SUBJECT_SUPERSEDED],
         },
         "rendering": {
             "rendered_records": [
@@ -217,6 +227,8 @@ def validate_prefetch_receipt(value: object) -> list[str]:
         errors.append("selection")
     elif selection.get("selected_count") != len(selection["selected_record_ids"]):
         errors.append("selection.selected_count")
+    elif "subject_superseded" in selection and not _subject_superseded_ok(selection["subject_superseded"]):
+        errors.append("selection.subject_superseded")
     if not isinstance(rendering, dict) or not isinstance(rendering.get("rendered_records"), list):
         errors.append("rendering")
     else:
@@ -290,6 +302,20 @@ def read_prefetch_receipt(omh_home: str | Path) -> dict[str, Any] | None:
 
 def _object(value: object) -> dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
+
+
+def _subject_superseded_ok(value: object) -> bool:
+    """A bounded list of {record_id, superseded_by} id pairs; absent on older receipts."""
+    return (
+        isinstance(value, list)
+        and len(value) <= MAX_SUBJECT_SUPERSEDED
+        and all(
+            isinstance(item, dict)
+            and set(item) == {"record_id", "superseded_by"}
+            and all(isinstance(item[key], str) and item[key] for key in item)
+            for item in value
+        )
+    )
 
 
 def _reminder_projection(reminder: dict[str, object] | None) -> dict[str, object] | None:

@@ -36,15 +36,21 @@ from .memory_recall_support import (
     _MEMORY_ATTENTION_RANK,
     _MEMORY_CADENCE_DEFAULTS,
     _MEMORY_PINS_LIMIT,
+    _RECALL_BM25_B,
+    _RECALL_BM25_K1,
+    _RECALL_BM25_RECORD_TYPE_WEIGHT,
+    _RECALL_BM25_TAG_WEIGHT,
     _RECALL_RRF_K,
     _RECALL_RRF_WEIGHTS,
+    _RECALL_SCORE_SCALE,
+    _TEMPORAL_RELEVANCE_BANDS,
     _REVIEW_DUE_SOON_DAYS,
     _attach_recall_ranking,
     _attention_disclosure,
     _cadence_value,
     _empty_recall_pack,
     _freshness_warnings,
-    _memory_recall_score,
+    _memory_relevance,
     _normalize_evaluator_timestamps,
     _ranking_field,
     _ranking_flag,
@@ -58,7 +64,9 @@ from .memory_recall_support import (
     _replay_evaluation,
     _resolve_query_intent,
     _scope,
+    newest_record,
     normalized_summary_key,
+    record_subject,
 )
 
 
@@ -167,6 +175,21 @@ def effective_recall_configuration() -> dict[str, object]:
         "recall_pack_schema_version": PROJECT_MEMORY_RECALL_PACK_SCHEMA_VERSION,
         "rrf_k": _RECALL_RRF_K,
         "rrf_weights": dict(sorted(_RECALL_RRF_WEIGHTS.items())),
+        "relevance": {
+            "model": "bm25f_whole_multiple_length/v1",
+            "k1": _RECALL_BM25_K1,
+            "b": _RECALL_BM25_B,
+            "tag_weight": _RECALL_BM25_TAG_WEIGHT,
+            "record_type_weight": _RECALL_BM25_RECORD_TYPE_WEIGHT,
+            "score_scale": _RECALL_SCORE_SCALE,
+            "stemmer": "light_english_suffix/v1",
+            "record_type_needs_content_hit": True,
+            "stemmed_only_overlap": "counts_when_the_pack_has_an_unstemmed_match/v1",
+            "temporal_relevance_bands": _TEMPORAL_RELEVANCE_BANDS,
+            "primary_key": "coverage_2_per_term_plus_1_per_tag/v1",
+            "query_closed_lists": "function_words_fillers_ko_prefixes_ja_zh_interrogatives/v2",
+            "listed_word_kept_when": "sole_term_or_all_caps_or_capitalized_mid_sentence/v1",
+        },
         "temporal_recency_weight": 2.0,
         "age_tier_bounds_days": list(_AGE_TIER_BOUNDS_DAYS),
         "age_tier_weights": list(_AGE_TIER_WEIGHTS),
@@ -182,7 +205,38 @@ def effective_recall_configuration() -> dict[str, object]:
         # what makes a report built before either existed refuse comparison.
         "query_fallback": "active_tier/v1",
         "duplicate_collapse": "normalized_exact_match/v1",
+        "subject_collapse": "newest_non_retired_per_scope_subject/v2",
+        "subject_score_transfer": "kept_record_shares_a_query_term/v1",
     }
+
+
+def _subject_group(record: dict[str, Any]) -> tuple[str, str, str] | None:
+    """(scope kind, scope ref, subject) for a record that declares a subject."""
+    subject = record_subject(record)
+    if not subject:
+        return None
+    scope = record.get("scope") if isinstance(record.get("scope"), dict) else {}
+    return (str(scope.get("kind", "")), str(scope.get("ref", "")), subject)
+
+
+def _current_subject_holders(pool: list[dict[str, Any]]) -> dict[tuple[str, str, str], str]:
+    """The record id that holds each (scope kind, scope ref, subject) now.
+
+    A subject is the slug the model declared at capture (`deploy-branch`), so
+    two records in one scope carrying it are two values of one thing, and only
+    the newest (`newest_record`) is current. The pool is every record the lens
+    admits that is still in the store -- whatever its attention tier or
+    eligibility -- so a superseded value cannot come back when the newest one
+    expires, goes stale or is archived; the subject still says it was replaced.
+    Only two structured fields are read, never the summaries, and a record
+    with no subject never joins a group.
+    """
+    groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for record in pool:
+        group = _subject_group(record)
+        if group is not None:
+            groups.setdefault(group, []).append(record)
+    return {group: str(newest_record(members).get("record_id", "")) for group, members in groups.items()}
 
 
 def _collapse_duplicate_summaries(
@@ -393,8 +447,18 @@ def select_memory_recall(
     usage = usage or {}
     included: list[dict[str, object]] = []
     excluded: list[dict[str, object]] = []
-    no_overlap_active: list[tuple[dict[str, object], dict[str, Any], dict[str, object], dict[str, object]]] = []
+    no_overlap_active: list[tuple[dict[str, object], dict[str, Any], dict[str, object], dict[str, object], int]] = []
     archived_excluded = 0
+    # Relevance is scored against the whole eligible candidate set (BM25 reads
+    # document frequencies and the average length from it), so the first pass
+    # decides lens, tier and eligibility and holds each record's outcome as a
+    # step; the second pass resolves the steps in store order, which keeps the
+    # order of `excluded_records` exactly what one pass produced.
+    steps: list[tuple[str, Any]] = []
+    candidates: list[tuple[dict[str, Any], dict[str, object], dict[str, object], str, bool]] = []
+    # Every lens-admitted record that declares a subject, whatever its tier or
+    # eligibility: the subject collapse decides "current" over all of them.
+    subject_pool: list[dict[str, Any]] = []
     for record in records:
         identity_decision = principal_recall_decision(record, parsed_principal, shared_surface=shared_surface)
         reason_code = str(identity_decision["reason_code"])
@@ -412,6 +476,8 @@ def select_memory_recall(
         if not _record_perspective_matches(record, observer=observer, observed=observed):
             hidden_exclusions["perspective_mismatch"] += 1
             continue
+        if record_subject(record):
+            subject_pool.append(record)
         attention_tier = _record_attention_tier(record, override=attention_override)
         if attention_tier == "archive" and not include_archived:
             # Archive is an attention tier, not a deletion. The record stays
@@ -419,12 +485,15 @@ def select_memory_recall(
             # with include_archived -- but it leaves the default working
             # context NAMED, never silently, so the operator can always see
             # what the archive is holding back.
-            excluded.append(
-                {
-                    "record_id": _redacted_metadata_label(record.get("record_id", "")),
-                    "reason": "archived_tier",
-                    "staleness": {"state": "not_checked"},
-                }
+            steps.append(
+                (
+                    "excluded",
+                    {
+                        "record_id": _redacted_metadata_label(record.get("record_id", "")),
+                        "reason": "archived_tier",
+                        "staleness": {"state": "not_checked"},
+                    },
+                )
             )
             archived_excluded += 1
             continue
@@ -465,22 +534,75 @@ def select_memory_recall(
             # handoff. Expired and otherwise-ineligible records stay excluded
             # regardless.
             if include_stale and str(evaluation.get("reason_code", "")) in _INSPECTABLE_STALE_REASONS:
-                score = _memory_recall_score(record, query)
-                if not query or score > 0 or str(record.get("record_id", "")) in pins:
-                    included.append(
-                        _recall_item(record, score=score, staleness=staleness, evaluation=evaluation, attention_tier=attention_tier)
-                    )
-                    continue
+                steps.append(("candidate", len(candidates)))
+                candidates.append((record, evaluation, staleness, attention_tier, True))
+                continue
+            steps.append(("excluded", _recall_exclusion(record, evaluation, staleness=staleness)))
+            continue
+        steps.append(("candidate", len(candidates)))
+        candidates.append((record, evaluation, staleness, attention_tier, False))
+    relevance = _memory_relevance([candidate[0] for candidate in candidates], query)
+    scores, unstemmed, coverage = list(relevance.scores), relevance.unstemmed, list(relevance.coverage)
+    holders = _current_subject_holders(subject_pool)
+    replaced_by: dict[int, str] = {}
+    group_members: dict[tuple[str, str, str], list[int]] = {}
+    for index, candidate in enumerate(candidates):
+        group = _subject_group(candidate[0])
+        if group is None:
+            continue
+        group_members.setdefault(group, []).append(index)
+        holder = holders.get(group, "")
+        if holder and holder != str(candidate[0].get("record_id", "")):
+            replaced_by[index] = holder
+    # The current value of a subject takes the best (coverage, score) in its
+    # group, but only when it shares a query term itself: a query that names
+    # the old wording still finds the new value of the same thing, while a
+    # record that matches nothing is never pulled in on another record's words
+    # (two facts given one slug by mistake must not serve the unrelated one).
+    for members in group_members.values():
+        best = max((coverage[index], scores[index]) for index in members)
+        for index in members:
+            if index not in replaced_by and scores[index] > 0:
+                coverage[index], scores[index] = best
+    # A stemmed-only match counts as overlap only when some live candidate also
+    # shares an unstemmed query token. Otherwise the query met the store only
+    # through a suffix rule (stats -> stat -> "State is kept in Redux"), and it
+    # falls back to the active tier exactly as a query matching nothing does;
+    # the stemmed matches keep their scores, so they lead that pack.
+    unstemmed_somewhere = any(
+        unstemmed[index] for index, candidate in enumerate(candidates) if not candidate[4] and index not in replaced_by
+    )
+
+    def overlaps(index: int) -> bool:
+        return scores[index] > 0 and (unstemmed[index] or unstemmed_somewhere)
+
+    for kind, value in steps:
+        if kind == "excluded":
+            excluded.append(value)
+            continue
+        record, evaluation, staleness, attention_tier, inspection_only = candidates[value]
+        score = scores[value]
+        if value in replaced_by:
+            exclusion = _recall_exclusion(record, evaluation, staleness=staleness, reason="superseded_by_subject")
+            exclusion["superseded_by"] = _redacted_metadata_label(replaced_by[value])
+            exclusion["subject"] = record_subject(record)
+            excluded.append(exclusion)
+            continue
+        if inspection_only:
+            if not query or overlaps(value) or str(record.get("record_id", "")) in pins:
+                included.append(
+                    _recall_item(record, score=score, staleness=staleness, evaluation=evaluation, attention_tier=attention_tier)
+                )
+                continue
             excluded.append(_recall_exclusion(record, evaluation, staleness=staleness))
             continue
-        score = _memory_recall_score(record, query)
         # A pinned anchor is always in context: it skips only the
         # no_query_overlap cut, never an eligibility check above.
-        if query and score <= 0 and str(record.get("record_id", "")) not in pins:
+        if query and not overlaps(value) and str(record.get("record_id", "")) not in pins:
             exclusion = _recall_exclusion(record, evaluation, staleness=staleness, reason="no_query_overlap")
             excluded.append(exclusion)
             if attention_tier == "active":
-                no_overlap_active.append((exclusion, record, evaluation, staleness))
+                no_overlap_active.append((exclusion, record, evaluation, staleness, max(score, 1)))
             continue
         included.append(_recall_item(record, score=score, staleness=staleness, evaluation=evaluation, attention_tier=attention_tier))
     # A chat message that shares no token with any record used to hand the
@@ -491,13 +613,15 @@ def select_memory_recall(
     # stays explicit, and any overlap at all (a partial match) means the
     # query did its job, so nothing is re-admitted then. A query with no
     # indexable tokens never reaches here: it already scores every record 1.
+    # A record that met the query only through stemming is readmitted with its
+    # score, so it leads the fallback pack; every other one scores 1.
     query_fallback: dict[str, object] | None = None
     if query and not included and no_overlap_active:
         readmitted = {id(entry) for entry, *_ in no_overlap_active}
         excluded = [entry for entry in excluded if id(entry) not in readmitted]
         included = [
-            _recall_item(record, score=1, staleness=staleness, evaluation=evaluation, attention_tier="active")
-            for _, record, evaluation, staleness in no_overlap_active
+            _recall_item(record, score=score, staleness=staleness, evaluation=evaluation, attention_tier="active")
+            for _, record, evaluation, staleness, score in no_overlap_active
         ]
         query_fallback = {"mode": "active_tier", "reason": "no_query_overlap", "readmitted_count": len(included)}
     included, duplicates = _collapse_duplicate_summaries(included, pins=pins)
@@ -508,6 +632,8 @@ def select_memory_recall(
         pins=pins,
         now=now,
         recency_weight=2.0 if query_intent == "temporal" else _RECALL_RRF_WEIGHTS["recency"],
+        temporal=query_intent == "temporal",
+        coverage={str(candidate[0].get("record_id", "")): coverage[index] for index, candidate in enumerate(candidates)},
     )
     # Pinned anchors lead, then attention tier, then relevance; the decayed
     # fused score orders records only within an equal relevance rank. A weaker

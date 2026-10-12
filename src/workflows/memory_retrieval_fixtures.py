@@ -34,7 +34,7 @@ from ..plugin_bundle.omh.memory_governance import (
     stable_artifact_identity,
 )
 
-FIXTURE_CORPUS_VERSION = "omh-memory-retrieval-fixtures/v3"
+FIXTURE_CORPUS_VERSION = "omh-memory-retrieval-fixtures/v4"
 FIXTURE_PROJECT_IDENTITY = "repo:" + hashlib.sha256(b"example.invalid/memory-fixture").hexdigest()[:32]
 # The corpus clock. Absolute, declared once, never derived from the host.
 FIXTURE_CLOCK = datetime(2031, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
@@ -73,18 +73,21 @@ def _record(
     admission_state: str = "approved_manual",
     contamination_class: str = "",
     source: str = "",
+    subject: str = "",
 ) -> dict[str, object]:
     """One fixture record specification, in the retained corpus's own shape.
 
     ``source`` names the admission channel the stored record carries; a case
-    about recovering from one wrong source needs records that differ on it. It
-    is emitted only when set, so every spec that does not care about the source
-    stays byte-identical and the corpus digest does not move.
+    about recovering from one wrong source needs records that differ on it.
+    ``subject`` is the model-declared subject slug a case about same-subject
+    supersession needs. Each is emitted only when set, so a spec that does not
+    care stays byte-identical.
     """
     if contamination_class and contamination_class not in CONTAMINATION_CLASSES:
         raise ValueError(f"unsupported contamination class: {contamination_class}")
     return {
         **({"source": source} if source else {}),
+        **({"subject": subject} if subject else {}),
         "record_id": record_id,
         "summary": summary,
         "approved_at": approved_at,
@@ -163,6 +166,8 @@ def materialize_fixture_record(spec: dict[str, object]) -> tuple[dict[str, objec
         record["perspective"] = {"observer": str(spec["observer"]), "observed": str(spec["observed"])}
     if str(spec["superseded_by"]):
         record["superseded_by"] = str(spec["superseded_by"])
+    if str(spec.get("subject", "")):
+        record["subject"] = str(spec["subject"])
     digest = canonical_payload_digest(record)
     admission = record["admission"]
     if isinstance(admission, dict):
@@ -234,6 +239,29 @@ _AGING = "2030-10-01T00:00:00Z"
 _OLD = "2029-06-01T00:00:00Z"
 _PAST_DEADLINE = "2030-11-15T00:00:00Z"
 _FUTURE_DEADLINE = "2032-06-01T00:00:00Z"
+
+# An ordinary store's worth of unrelated records. Cases about term weighting
+# carry them because how rare a word is belongs to a store, not to one record:
+# in a two-record store "the" is exactly as rare as "backup".
+_BACKGROUND: tuple[dict[str, object], ...] = (
+    _record("mem_bg1", "The team uses squash merges for every pull request", approved_at=_AGING, tags=("vcs",)),
+    _record("mem_bg2", "Release notes are drafted by the author of the change", approved_at=_AGING, tags=("release",)),
+    _record("mem_bg3", "The staging cluster is rebuilt every sunday night", approved_at=_AGING, tags=("staging",)),
+    _record("mem_bg4", "Error budgets are reviewed in the monthly ops meeting", approved_at=_AGING, tags=("sre",)),
+    _record("mem_bg5", "Python 3.12 is the minimum supported version for the CLI", approved_at=_AGING, tags=("python",)),
+    _record("mem_bg6", "The user prefers concise replies without emoji", approved_at=_AGING, tags=("style",)),
+)
+_BACKGROUND_IDS = tuple(str(spec["record_id"]) for spec in _BACKGROUND)
+
+# The long onboarding record two length cases share: it mentions many topics
+# once each, the way a checklist captured in one sentence does.
+_LONG_ONBOARDING = _record(
+    "mem_s12_long",
+    "Onboarding: install docker and homebrew, clone the monorepo, run the bootstrap script, request VPN access "
+    "from IT, then use the node seed script in tools to load sample data into the local database",
+    approved_at=_YOUNG,
+    tags=("onboarding",),
+)
 
 
 RETRIEVAL_CASES: tuple[dict[str, object], ...] = (
@@ -556,6 +584,508 @@ RETRIEVAL_CASES: tuple[dict[str, object], ...] = (
         query="préférence",
         included_order=("mem_re1_preference",),
         excluded_reasons=(("mem_re2_pr", "no_query_overlap"),),
+    ),
+    _case(
+        "inflection_deployment_reaches_deploy_records",
+        "A user asking how deployment is handled is answered by the deploy record, ahead of a record that only shares 'handled'.",
+        records=(
+            _record("mem_s01_deploys", "Deploys go out through the release pipeline", approved_at=_YOUNG, tags=("deploy",)),
+            _record("mem_s02_handled", "Hotfixes are handled by the on-call engineer", approved_at=_YOUNG, tags=("hotfix", "on-call")),
+            _record("mem_s03_design", "The design review happens on thursdays", approved_at=_YOUNG, tags=("design",)),
+        ),
+        query="how is deployment handled?",
+        included_order=("mem_s01_deploys", "mem_s02_handled"),
+        excluded_reasons=(("mem_s03_design", "no_query_overlap"),),
+    ),
+    _case(
+        "inflection_migration_reaches_a_plural_summary",
+        "A singular query word finds the plural summary, and the specific term outranks a generic one two records share.",
+        records=(
+            _record("mem_s04_migrations", "Database migrations run from the deploy job, never by hand", approved_at=_YOUNG, tags=("database", "deploy")),
+            _record("mem_s05_lint", "Lint rules live in ruff.toml", approved_at=_YOUNG, tags=("lint",)),
+            _record("mem_s06_protection", "Branch protection rules require one approval", approved_at=_YOUNG, tags=("github",)),
+        ),
+        query="schema migration rules",
+        included_order=("mem_s04_migrations", "mem_s05_lint", "mem_s06_protection"),
+    ),
+    _case(
+        "stemmed_only_match_leads_the_fallback_pack",
+        # Pre-registered as "'caching' alone answers the cache record"; that
+        # changed with the stemmed-only rule (review of #2091, M1): no record
+        # shares an unstemmed word, so the stemmed match may not suppress the
+        # active-tier fallback, and it leads the fallback pack instead.
+        "'caching' meets the cache record only through stemming, so the pack falls back to the active tier with the cache record first.",
+        records=(
+            _record("mem_s07_cache", "Cache keys include the schema version", approved_at=_YOUNG, tags=("cache",)),
+            _record("mem_s08_branches", "Feature branches are deleted after merge", approved_at=_YOUNG, tags=("vcs",)),
+            _record("mem_s09_oncall", "On-call rotates every monday", approved_at=_YOUNG, tags=("oncall",)),
+        ),
+        query="caching strategy",
+        included_order=("mem_s07_cache", "mem_s08_branches", "mem_s09_oncall"),
+    ),
+    _case(
+        "tag_match_ranks_above_an_incidental_summary_mention",
+        "The record tagged with the query term leads a record whose summary only lists the word in passing.",
+        records=(
+            _record("mem_s10_compose", "Local services start with compose up from the repo root", approved_at=_YOUNG, tags=("docker", "local-dev")),
+            _record("mem_s11_doc", "The onboarding doc lists docker, homebrew and the VPN client", approved_at=_YOUNG, tags=("onboarding",)),
+        ),
+        query="docker",
+        included_order=("mem_s10_compose", "mem_s11_doc"),
+    ),
+    _case(
+        "tag_and_inflection_find_the_flaky_test_policy",
+        "The record tagged flaky and tests leads; a summary about snapshot tests matches 'test' and follows it.",
+        records=(
+            _record("mem_s24_retry", "Retry the integration suite once before reporting a failure", approved_at=_YOUNG, tags=("flaky", "tests")),
+            _record("mem_s25_snapshot", "Snapshot tests are updated with the update flag", approved_at=_YOUNG, tags=("snapshot",)),
+        ),
+        query="flaky test",
+        included_order=("mem_s24_retry", "mem_s25_snapshot"),
+    ),
+    _case(
+        "focused_short_record_beats_a_long_incidental_mention",
+        "Equal dates, and the long record has the smaller id: only its length can put the focused Node fact first.",
+        records=(
+            _LONG_ONBOARDING,
+            _record("mem_s13_node", "Node 22 is pinned in .nvmrc", approved_at=_YOUNG, tags=("toolchain",)),
+            _record("mem_s14_prettier", "Prettier formats all TypeScript files on commit", approved_at=_YOUNG, tags=("format",)),
+            _record("mem_s15_review", "Pull requests need one approving review", approved_at=_YOUNG, tags=("review",)),
+        ),
+        query="which node version",
+        included_order=("mem_s13_node", "mem_s12_long"),
+        excluded_reasons=(("mem_s14_prettier", "no_query_overlap"), ("mem_s15_review", "no_query_overlap")),
+    ),
+    _case(
+        "long_record_still_leads_when_it_carries_the_query",
+        "Length never outweighs coverage: the long record answering three query terms leads a short one answering one.",
+        records=(
+            _LONG_ONBOARDING,
+            _record("mem_s16_vpn", "VPN profiles are stored in 1Password", approved_at=_YOUNG, tags=("vpn",)),
+            _record("mem_s13_node", "Node 22 is pinned in .nvmrc", approved_at=_YOUNG, tags=("toolchain",)),
+            _record("mem_s15_review", "Pull requests need one approving review", approved_at=_YOUNG, tags=("review",)),
+        ),
+        query="onboarding vpn access",
+        included_order=("mem_s12_long", "mem_s16_vpn"),
+        excluded_reasons=(("mem_s13_node", "no_query_overlap"), ("mem_s15_review", "no_query_overlap")),
+    ),
+    _case(
+        "korean_query_with_particles_finds_the_deploy_branch_record",
+        "A Korean question with particles finds the deploy-branch record; a record sharing only the bigram 브랜 follows it.",
+        records=(
+            _record("mem_k01_branch", "배포는 release 브랜치에서만 한다", approved_at=_YOUNG, tags=("deploy",)),
+            _record("mem_k02_brand", "브랜드 색상은 파란색이다", approved_at=_YOUNG, tags=("design",)),
+            _record("mem_k03_review", "코드 리뷰는 한 명의 승인이 필요하다", approved_at=_YOUNG, tags=("review",)),
+        ),
+        query="배포 브랜치가 뭐였지?",
+        included_order=("mem_k01_branch", "mem_k02_brand"),
+        excluded_reasons=(("mem_k03_review", "no_query_overlap"),),
+    ),
+    _case(
+        "chinese_query_bigrams_find_the_deploy_process_record",
+        "A Chinese query finds the record that states the deploy process ahead of one that shares only 流程.",
+        records=(
+            _record("mem_c01_deploy", "部署流程需要两个人批准", approved_at=_YOUNG, tags=("deploy",)),
+            _record("mem_c02_test", "测试流程在CI中运行", approved_at=_YOUNG, tags=("ci",)),
+        ),
+        query="部署流程",
+        included_order=("mem_c01_deploy", "mem_c02_test"),
+    ),
+    _case(
+        "japanese_query_finds_the_deploy_procedure_record",
+        "A Japanese query finds the deploy procedure ahead of a test procedure that shares only 手順.",
+        records=(
+            _record("mem_j01_deploy", "デプロイ手順はREADMEにある", approved_at=_YOUNG, tags=("deploy",)),
+            _record("mem_j02_test", "テスト手順はCIで動く", approved_at=_YOUNG, tags=("ci",)),
+        ),
+        query="デプロイ手順",
+        included_order=("mem_j01_deploy", "mem_j02_test"),
+    ),
+    _case(
+        "mixed_language_query_ranks_full_coverage_first",
+        "An English-and-Korean query leads with the record covering all three terms, then the same environment, then the shared noun.",
+        records=(
+            _record("mem_x01_address", "staging 서버 주소는 10.0.0.12 이다", approved_at=_YOUNG, tags=("staging", "infra")),
+            _record("mem_x02_production", "production 서버는 세 대이다", approved_at=_YOUNG, tags=("production", "infra")),
+            _record("mem_x03_deploy", "staging 배포는 자동이다", approved_at=_YOUNG, tags=("staging", "deploy")),
+        ),
+        query="staging 서버 주소",
+        included_order=("mem_x01_address", "mem_x03_deploy", "mem_x02_production"),
+    ),
+    _case(
+        "common_words_do_not_outrank_the_rare_match",
+        "A chat message sharing 'plan' (and function words) with an offsite note must not outrank the backup rotation record.",
+        records=(
+            _record("mem_s21_backup", "Backups rotate weekly and four snapshots are kept", approved_at=_YOUNG, tags=("backup",)),
+            _record("mem_s22_offsite", "The plan for the offsite is to book the venue for the team in March", approved_at=_YOUNG, tags=("team",)),
+            *_BACKGROUND,
+        ),
+        query="what is the plan for the backup rotation?",
+        limit=1,
+        included_order=("mem_s21_backup",),
+        # The question's function words ("what", "is", "the", "for") are not
+        # query terms, so records sharing only those do not overlap at all.
+        excluded_reasons=(("mem_s22_offsite", "over_budget"), *((record_id, "no_query_overlap") for record_id in _BACKGROUND_IDS)),
+        truncated=True,
+    ),
+    _case(
+        "pull_request_wording_does_not_answer_who_reviews_docs",
+        "Asked who reviews docs pull requests, the docs-review record answers; the squash-merge record only shares wording.",
+        records=(
+            _record("mem_s23_docs", "Docs changes are reviewed by the tech writer", approved_at=_YOUNG, tags=("docs", "review")),
+            *_BACKGROUND,
+        ),
+        query="who reviews pull requests for the docs?",
+        limit=1,
+        included_order=("mem_s23_docs",),
+        excluded_reasons=(
+            ("mem_bg1", "over_budget"),
+            ("mem_bg4", "over_budget"),
+            *((record_id, "no_query_overlap") for record_id in _BACKGROUND_IDS if record_id not in {"mem_bg1", "mem_bg4"}),
+        ),
+        truncated=True,
+    ),
+    _case(
+        "stemming_reads_news_as_new_below_the_real_match",
+        # The right answer serves mem_s17_hires alone; this pins the known
+        # cost of the light stemmer, which reads 'news' as 'new'. The old
+        # exact-word match kept the news record out.
+        "Known cost, pinned: the light stemmer reads 'news' as 'new', so the release-news record is served after the onboarding record.",
+        records=(
+            _record("mem_s17_hires", "New hires get a laptop and a buddy on day one", approved_at=_YOUNG, tags=("onboarding",)),
+            _record("mem_s18_news", "Release news is posted in the announce channel", approved_at=_YOUNG, tags=("release",)),
+        ),
+        query="new hire onboarding",
+        included_order=("mem_s17_hires", "mem_s18_news"),
+    ),
+    _case(
+        "stemming_keeps_apply_apart_from_app",
+        "'apply' is not cut down to 'app': the mobile app record stays out while the staging patch record answers.",
+        records=(
+            _record("mem_s19_patches", "Patches land on staging before production", approved_at=_YOUNG, tags=("staging",)),
+            _record("mem_s20_app", "The mobile app ships through TestFlight", approved_at=_YOUNG, tags=("mobile",)),
+        ),
+        query="apply patch staging",
+        included_order=("mem_s19_patches",),
+        excluded_reasons=(("mem_s20_app", "no_query_overlap"),),
+    ),
+    _case(
+        "same_subject_serves_only_the_newest_value",
+        "Two records declare subject deploy-branch: only the newest approved value is served, the older one is named.",
+        records=(
+            _record("mem_u01_release", "Deploys go from the release branch", approved_at=_AGING, tags=("deploy",), subject="deploy-branch"),
+            _record("mem_u02_main", "Deploys go from main and the release branch is retired", approved_at=_YOUNG, tags=("deploy",), subject="deploy-branch"),
+        ),
+        query="which branch do deploys go from",
+        included_order=("mem_u02_main",),
+        excluded_reasons=(("mem_u01_release", "superseded_by_subject"),),
+    ),
+    _case(
+        "same_subject_old_wording_never_brings_the_old_value_back",
+        # Pre-registered as "the current value leads"; that changed with the
+        # score-transfer rule (review of #2091, Q3): the current value shares
+        # no query word, so it takes no score from the old one. The style
+        # record matches only through stemming, so the pack falls back.
+        "The query names the old wording of reply-language: the old value stays out, and the current value arrives through the fallback.",
+        records=(
+            _record("mem_u03_korean", "Reply language for this user is Korean", approved_at=_AGING, tags=("style",), subject="reply-language"),
+            _record("mem_u04_english", "The user wants answers in English", approved_at=_YOUNG, tags=("style",), subject="reply-language"),
+            _record("mem_u05_concise", "The user prefers concise replies without emoji", approved_at=_YOUNG, tags=("style",)),
+        ),
+        query="reply language",
+        included_order=("mem_u05_concise", "mem_u04_english"),
+        excluded_reasons=(("mem_u03_korean", "superseded_by_subject"),),
+    ),
+    _case(
+        "different_subjects_never_collapse",
+        "Two deploy records with different subjects are separate facts and both stay in the pack.",
+        records=(
+            _record("mem_v01_branch", "Deploys go from main", approved_at=_YOUNG, tags=("deploy",), subject="deploy-branch"),
+            _record("mem_v02_window", "Deploys happen between 10:00 and 16:00 KST", approved_at=_YOUNG, tags=("deploy",), subject="deploy-window"),
+        ),
+        query="deploy setup",
+        included_order=("mem_v01_branch", "mem_v02_window"),
+    ),
+    _case(
+        "same_subject_in_different_scopes_stays_separate",
+        "A project record and a user-global record share a subject; each scope keeps its own value, newest first.",
+        records=(
+            _record("mem_w01_repo", "Reply language in this repository is Korean", approved_at=_AGING, tags=("style",), subject="reply-language"),
+            _record(
+                "mem_w02_global",
+                "Reply language everywhere else is English",
+                approved_at=_YOUNG,
+                tags=("style",),
+                subject="reply-language",
+                scope_kind="user-global",
+                scope_ref="default",
+            ),
+        ),
+        query="reply language",
+        included_order=("mem_w02_global", "mem_w01_repo"),
+    ),
+    # The review of #2091 probed the first BM25 revision with these stores and
+    # queries; they are copied verbatim, with the dispositions the review asked for.
+    _case(
+        "english_question_word_outranks_topic",
+        "Review of #2091 (H2): 'how' is a function word, so the record opening with 'How expenses' never outranks the deploy records.",
+        records=(
+            _record("mem_q1", "Deploy through the release pipeline after CI is green", approved_at=_YOUNG, tags=("deploy",)),
+            _record("mem_q2", "Deploy approvals need two reviewers", approved_at=_YOUNG, tags=("deploy",)),
+            _record("mem_q3", "Deploy freezes start on december 20", approved_at=_YOUNG, tags=("deploy",)),
+            _record("mem_q4", "How expenses are filed is documented in the wiki", approved_at=_YOUNG, tags=("finance",)),
+        ),
+        query="how do we deploy?",
+        included_order=("mem_q1", "mem_q2", "mem_q3"),
+        excluded_reasons=(("mem_q4", "no_query_overlap"),),
+    ),
+    _case(
+        "all_korean_store",
+        "Review of #2091 (H2): 어떻게 is a function word, so '어떻게 해야 할지 모르면' never outranks the deploy records.",
+        records=(
+            _record("mem_h1", "배포는 release 브랜치에서만 한다", approved_at=_YOUNG, tags=("deploy",)),
+            _record("mem_h2", "배포 승인은 두 명이 필요하다", approved_at=_YOUNG, tags=("deploy",)),
+            _record("mem_h3", "코드 리뷰는 한 명의 승인이 필요하다", approved_at=_YOUNG, tags=("review",)),
+            _record("mem_h4", "어떻게 해야 할지 모르면 팀장에게 묻는다", approved_at=_YOUNG, tags=("process",)),
+        ),
+        query="배포는 어떻게 해?",
+        included_order=("mem_h1", "mem_h2"),
+        excluded_reasons=(("mem_h3", "no_query_overlap"), ("mem_h4", "no_query_overlap"),),
+    ),
+    _case(
+        "korean_question_word_who",
+        "Review of #2091 (H2): 누가 is a function word, so the meeting-notes record never outranks the deploy records.",
+        records=(
+            _record("mem_r1", "배포 승인은 두 명의 리뷰어가 한다", approved_at=_YOUNG, tags=("deploy",)),
+            _record("mem_r2", "배포는 release 브랜치에서만 한다", approved_at=_YOUNG, tags=("deploy",)),
+            _record("mem_r3", "배포 동결은 12월 20일부터다", approved_at=_YOUNG, tags=("deploy",)),
+            _record("mem_r4", "누가 회의록을 쓰는지는 주간 회의에서 정한다", approved_at=_YOUNG, tags=("meeting",)),
+        ),
+        query="배포 승인은 누가 해?",
+        included_order=("mem_r1", "mem_r2", "mem_r3"),
+        excluded_reasons=(("mem_r4", "no_query_overlap"),),
+    ),
+    _case(
+        "stats_conflates_with_state",
+        "Review of #2091 (M1): 'stats' meets 'State' only through stemming, so the pack falls back to the active tier.",
+        records=(
+            _record("mem_a1_state", "State is kept in a Redux store", approved_at=_YOUNG, tags=("frontend",)),
+            _record("mem_a2_grafana", "Grafana dashboards hold the latency metrics", approved_at=_YOUNG, tags=("observability",)),
+            _record("mem_a3_release", "Releases ship on fridays", approved_at=_YOUNG, tags=("release",)),
+        ),
+        query="stats location?",
+        included_order=("mem_a1_state", "mem_a2_grafana", "mem_a3_release"),
+    ),
+    _case(
+        "news_conflates_with_new",
+        "Review of #2091 (M1): 'news' meets 'New hires' only through stemming, so the pack falls back to the active tier.",
+        records=(
+            _record("mem_b1_hires", "New hires get a laptop on day one", approved_at=_YOUNG, tags=("onboarding",)),
+            _record("mem_b2_announce", "Release notes are posted in announce", approved_at=_YOUNG, tags=("release",)),
+        ),
+        query="any news?",
+        included_order=("mem_b1_hires", "mem_b2_announce"),
+    ),
+    _case(
+        "like_conflates_with_likely",
+        "Review of #2091 (M1): 'like' meets 'likely' only through stemming, so the pack falls back to the active tier.",
+        records=(
+            _record("mem_c1_flaky", "Flaky tests are likely caused by shared fixtures", approved_at=_YOUNG, tags=("tests",)),
+            _record("mem_c2_style", "The user prefers short replies", approved_at=_YOUNG, tags=("style",)),
+        ),
+        query="I would like concise answers",
+        included_order=("mem_c1_flaky", "mem_c2_style"),
+    ),
+    _case(
+        "even_conflates_with_evening",
+        "Review of #2091 (M1): 'even' meets 'evening' only through stemming, so the pack falls back to the active tier.",
+        records=(
+            _record("mem_d1_freeze", "Deploys freeze in the evening", approved_at=_YOUNG, tags=("deploy",)),
+            _record("mem_d2_oncall", "On-call rotates every monday", approved_at=_YOUNG, tags=("oncall",)),
+        ),
+        query="even weekends?",
+        included_order=("mem_d1_freeze", "mem_d2_oncall"),
+    ),
+    _case(
+        "statement_conflates_with_state",
+        "Review of #2091 (M1): 'statement' meets 'state' only through stemming, so the pack falls back to the active tier.",
+        records=(
+            _record("mem_e1_state", "Global state lives in zustand", approved_at=_YOUNG, tags=("frontend",)),
+            _record("mem_e2_pay", "Invoices are paid by wire transfer", approved_at=_YOUNG, tags=("finance",)),
+        ),
+        query="bank statement",
+        included_order=("mem_e1_state", "mem_e2_pay"),
+    ),
+    _case(
+        "temporal_recent_deploy_decision",
+        "Review of #2091 (M2): a temporal query bands relevance, so the newer deploy-window decision leads the older one that repeats 'deploy'.",
+        records=(
+            _record("mem_p1_old", "Deploy windows are 10:00 to 16:00 and deploys need approval from the release manager", approved_at="2030-06-01T00:00:00Z", tags=("deploy",)),
+            _record("mem_p2_new", "Deploy windows moved to 09:00 to 12:00", approved_at="2030-12-30T00:00:00Z", tags=("deploy",)),
+        ),
+        query="what did we decide recently about deploy windows",
+        included_order=("mem_p2_new", "mem_p1_old"),
+    ),
+    _case(
+        "record_type_plural_floods_pack",
+        "Review of #2091 (M3): 'facts' names a record type; with no summary or tag hit it adds nothing, so only the deploy record is served.",
+        records=(
+            _record("mem_j00", "Python 3.12 is the minimum version", approved_at=_YOUNG, tags=("python",)),
+            _record("mem_j01", "Lint rules live in ruff.toml", approved_at=_YOUNG, tags=("lint",)),
+            _record("mem_j02", "The staging cluster is rebuilt nightly", approved_at=_YOUNG, tags=("staging",)),
+            _record("mem_j03", "Error budgets are reviewed monthly", approved_at=_YOUNG, tags=("sre",)),
+            _record("mem_j04", "Release notes are drafted by the author", approved_at=_YOUNG, tags=("release",)),
+            _record("mem_j05", "Squash merges are used for every pull request", approved_at=_YOUNG, tags=("vcs",)),
+            _record("mem_j06", "The VPN profile is stored in 1Password", approved_at=_YOUNG, tags=("vpn",)),
+            _record("mem_j99_deploy", "Deploys go out through the release pipeline", approved_at=_YOUNG, tags=("deploy",)),
+        ),
+        query="any facts about deploys?",
+        included_order=("mem_j99_deploy",),
+        excluded_reasons=(("mem_j00", "no_query_overlap"), ("mem_j01", "no_query_overlap"), ("mem_j02", "no_query_overlap"), ("mem_j03", "no_query_overlap"), ("mem_j04", "no_query_overlap"), ("mem_j05", "no_query_overlap"), ("mem_j06", "no_query_overlap"),),
+    ),
+    _case(
+        "subject_newest_expired_resurrects_old",
+        "Review of #2091 (M5): the newest deploy-branch value expired; the older value stays superseded instead of coming back.",
+        records=(
+            _record("mem_n1_old", "Deploys go from the release branch", approved_at=_AGING, tags=("deploy",), retention_class="durable", subject="deploy-branch"),
+            _record("mem_n2_new", "Deploys go from main", approved_at=_YOUNG, tags=("deploy",), retention_class="volatile", expires_at="2030-12-30T00:00:00Z", subject="deploy-branch"),
+        ),
+        query="deploy branch",
+        included_order=(),
+        excluded_reasons=(("mem_n1_old", "superseded_by_subject"), ("mem_n2_new", "expired_volatile"),),
+    ),
+    _case(
+        "subject_newest_archived_resurrects_old",
+        "Review of #2091 (M5): the newest deploy-branch value is archived; the older value stays superseded instead of coming back.",
+        records=(
+            _record("mem_o1_old", "Deploys go from the release branch", approved_at=_AGING, tags=("deploy",), subject="deploy-branch"),
+            _record("mem_o2_new", "Deploys go from main", approved_at=_YOUNG, tags=("deploy",), attention_tier="archive", subject="deploy-branch"),
+        ),
+        query="deploy branch",
+        included_order=(),
+        excluded_reasons=(("mem_o1_old", "superseded_by_subject"), ("mem_o2_new", "archived_tier"),),
+    ),
+    # The re-review of #2091 probed the second revision with these question-shaped
+    # stores; copied verbatim. The merge bar: no unrelated record above the topic
+    # record the old scorer ranked first, and a listed word in capitals still scores.
+    _case(
+        "ja_interrogative_how",
+        "Review of #2091 (H2): どう is cut out of the query, and coverage keeps every deploy record above the record that only shares やる and るの.",
+        records=(
+            _record("mem_ja1", "デプロイ手順はREADMEにある", approved_at=_YOUNG, tags=("deploy",)),
+            _record("mem_ja2", "デプロイ前にテストを走らせる", approved_at=_YOUNG, tags=("deploy",)),
+            _record("mem_ja3", "デプロイは金曜日にしない", approved_at=_YOUNG, tags=("deploy",)),
+            _record("mem_ja4", "どうやるのか分からない時はSlackで聞く", approved_at=_YOUNG, tags=("process",)),
+        ),
+        query="デプロイはどうやるの？",
+        included_order=("mem_ja3", "mem_ja1", "mem_ja2", "mem_ja4"),
+    ),
+    _case(
+        "zh_interrogative_how",
+        "Review of #2091 (H2): 怎么 is cut out of the query before bigrams, so only the deploy records match 部署.",
+        records=(
+            _record("mem_zh1", "部署流程需要两个人批准", approved_at=_YOUNG, tags=("deploy",)),
+            _record("mem_zh2", "部署前要跑测试", approved_at=_YOUNG, tags=("deploy",)),
+            _record("mem_zh3", "周五不部署", approved_at=_YOUNG, tags=("deploy",)),
+            _record("mem_zh4", "不知道怎么办就问组长", approved_at=_YOUNG, tags=("process",)),
+        ),
+        query="怎么部署？",
+        included_order=("mem_zh1", "mem_zh2", "mem_zh3"),
+        excluded_reasons=(("mem_zh4", "no_query_overlap"),),
+    ),
+    _case(
+        "ko_variant_eonjejjeum",
+        "Review of #2091 (H2): a run starting with 언제 is dropped whole, so 언제쯤이야 never matches the meeting record.",
+        records=(
+            _record("mem_k1", "배포는 release 브랜치에서만 한다", approved_at=_YOUNG, tags=("deploy",)),
+            _record("mem_k2", "배포 승인은 두 명이 필요하다", approved_at=_YOUNG, tags=("deploy",)),
+            _record("mem_k3", "배포 동결은 12월 20일부터다", approved_at=_YOUNG, tags=("deploy",)),
+            _record("mem_k4", "언제 회의할지는 팀장이 정한다", approved_at=_YOUNG, tags=("meeting",)),
+            _record("mem_k5", "누가요 라는 질문에는 담당자 표를 보여준다", approved_at=_YOUNG, tags=("process",)),
+        ),
+        query="배포 언제쯤이야?",
+        included_order=("mem_k1", "mem_k2", "mem_k3"),
+        excluded_reasons=(("mem_k4", "no_query_overlap"), ("mem_k5", "no_query_overlap"),),
+    ),
+    _case(
+        "en_remind",
+        "Review of #2091 (H2): 'remind' is a chat filler, and coverage keeps a deploy record with its tag above any stray-word record.",
+        records=(
+            _record("mem_e1", "Deploy through the release pipeline after CI is green", approved_at=_YOUNG, tags=("deploy",)),
+            _record("mem_e2", "Deploy approvals need two reviewers", approved_at=_YOUNG, tags=("deploy",)),
+            _record("mem_e3", "Deploy freezes start on december 20", approved_at=_YOUNG, tags=("deploy",)),
+            _record("mem_e4", "We remind new hires to enable 2FA", approved_at=_YOUNG, tags=("security",)),
+            _record("mem_e5", "Quick fixes go through the hotfix branch", approved_at=_YOUNG, tags=("hotfix",)),
+            _record("mem_e6", "Open questions are tracked in the RFC doc", approved_at=_YOUNG, tags=("rfc",)),
+        ),
+        query="can you remind me how we deploy?",
+        included_order=("mem_e1", "mem_e2", "mem_e3"),
+        excluded_reasons=(("mem_e4", "no_query_overlap"), ("mem_e5", "no_query_overlap"), ("mem_e6", "no_query_overlap"),),
+    ),
+    _case(
+        "en_quick_question",
+        "Review of #2091 (H2): 'quick question' is filler, so neither the hotfix nor the RFC record outranks the deploy records.",
+        records=(
+            _record("mem_e1", "Deploy through the release pipeline after CI is green", approved_at=_YOUNG, tags=("deploy",)),
+            _record("mem_e2", "Deploy approvals need two reviewers", approved_at=_YOUNG, tags=("deploy",)),
+            _record("mem_e3", "Deploy freezes start on december 20", approved_at=_YOUNG, tags=("deploy",)),
+            _record("mem_e4", "We remind new hires to enable 2FA", approved_at=_YOUNG, tags=("security",)),
+            _record("mem_e5", "Quick fixes go through the hotfix branch", approved_at=_YOUNG, tags=("hotfix",)),
+            _record("mem_e6", "Open questions are tracked in the RFC doc", approved_at=_YOUNG, tags=("rfc",)),
+        ),
+        query="quick question: do we deploy on fridays?",
+        included_order=("mem_e1", "mem_e2", "mem_e3"),
+        excluded_reasons=(("mem_e4", "no_query_overlap"), ("mem_e5", "no_query_overlap"), ("mem_e6", "no_query_overlap"),),
+    ),
+    _case(
+        "who_org_as_topic_alone",
+        "Review of #2091 (H2 rule 3): 'WHO' in capitals names something, so it scores although 'who' is a function word.",
+        records=(
+            _record("mem_w1", "WHO travel advisories are checked before booking offsites", approved_at=_YOUNG, tags=("travel",)),
+            _record("mem_w2", "Offsite venues are booked by the ops lead", approved_at=_YOUNG, tags=("offsite",)),
+            _record("mem_w3", "Budget reviews happen monthly", approved_at=_YOUNG, tags=("budget",)),
+        ),
+        query="WHO?",
+        included_order=("mem_w1",),
+        excluded_reasons=(("mem_w2", "no_query_overlap"), ("mem_w3", "no_query_overlap"),),
+    ),
+    _case(
+        "who_org_with_words",
+        "Review of #2091 (H2 rule 3): capital 'WHO' mid-question still scores, beside 'travel'.",
+        records=(
+            _record("mem_w1", "WHO travel advisories are checked before booking offsites", approved_at=_YOUNG, tags=("travel",)),
+            _record("mem_w2", "Offsite venues are booked by the ops lead", approved_at=_YOUNG, tags=("offsite",)),
+            _record("mem_w3", "Budget reviews happen monthly", approved_at=_YOUNG, tags=("budget",)),
+        ),
+        query="what does WHO say about travel",
+        included_order=("mem_w1",),
+        excluded_reasons=(("mem_w2", "no_query_overlap"), ("mem_w3", "no_query_overlap"),),
+    ),
+    _case(
+        "will_person_topic",
+        "Review of #2091 (H2 rule 3): 'Will' capitalized mid-sentence names a person and scores.",
+        records=(
+            _record("mem_wl1", "Will owns the budget spreadsheet", approved_at=_YOUNG, tags=("budget",)),
+            _record("mem_wl2", "Budget reviews happen monthly", approved_at=_YOUNG, tags=("budget",)),
+            _record("mem_wl3", "The CAN bus logger runs on the test rig", approved_at=_YOUNG, tags=("hardware",)),
+            _record("mem_wl4", "Bus timeouts are retried twice", approved_at=_YOUNG, tags=("hardware",)),
+        ),
+        query="ask Will",
+        included_order=("mem_wl1",),
+        excluded_reasons=(("mem_wl2", "no_query_overlap"), ("mem_wl3", "no_query_overlap"), ("mem_wl4", "no_query_overlap"),),
+    ),
+    _case(
+        "can_bus_topic",
+        "Review of #2091 (H2 rule 3): 'CAN' in capitals names the bus and scores with 'logger'.",
+        records=(
+            _record("mem_wl1", "Will owns the budget spreadsheet", approved_at=_YOUNG, tags=("budget",)),
+            _record("mem_wl2", "Budget reviews happen monthly", approved_at=_YOUNG, tags=("budget",)),
+            _record("mem_wl3", "The CAN bus logger runs on the test rig", approved_at=_YOUNG, tags=("hardware",)),
+            _record("mem_wl4", "Bus timeouts are retried twice", approved_at=_YOUNG, tags=("hardware",)),
+        ),
+        query="CAN logger",
+        included_order=("mem_wl3",),
+        excluded_reasons=(("mem_wl1", "no_query_overlap"), ("mem_wl2", "no_query_overlap"), ("mem_wl4", "no_query_overlap"),),
     ),
 )
 

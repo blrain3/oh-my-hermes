@@ -4,13 +4,15 @@ Extracted from the control-plane facade. No store mutation or host imports.
 """
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections import Counter
+from collections.abc import Iterable, Mapping
 import hashlib
+import math
 import re
 import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from .hermes_memory import classify_record_expiry as _classify_record_expiry
 from .memory_governance import (
@@ -49,6 +51,30 @@ _DEFAULT_PERSPECTIVE_OBSERVER = "hermes"
 _RECALL_RRF_K = 60
 
 _RECALL_RRF_WEIGHTS = {"relevance": 2.0, "recency": 1.0, "usage": 1.0}
+
+# BM25 relevance (the Okapi defaults k1 and b), over three fields: the summary,
+# the tags, and the record type. A summary hit is the unit. A tag is a label the
+# captor chose for the topic, so a tag hit weighs twice that; the record type is
+# a category word and weighs like one summary word. Scores are stored as
+# integer thousandths so ties are exact and survive JSON.
+_RECALL_BM25_K1 = 1.2
+
+_RECALL_BM25_B = 0.75
+
+_RECALL_BM25_TAG_WEIGHT = 2.0
+
+_RECALL_BM25_RECORD_TYPE_WEIGHT = 1.0
+
+_RECALL_SCORE_SCALE = 1000
+
+# A temporal query ranks relevance in this many bands below the best score
+# (see `_attach_recall_ranking`), so recency can order comparable matches.
+_TEMPORAL_RELEVANCE_BANDS = 4
+
+# A model-declared subject: a short slug naming what a fact is about
+# (`deploy-branch`, `reply-language`), so two records stating different values
+# of one thing are recognized by a field, never by reading their text.
+MEMORY_SUBJECT_PATTERN = re.compile(r"[a-z0-9][a-z0-9-]{0,47}")
 
 _SOURCE_EVIDENCE_MAX_BYTES = 4 * 1024 * 1024
 
@@ -149,6 +175,8 @@ def _attach_recall_ranking(
     pins: set[str] | None = None,
     now: datetime | None = None,
     recency_weight: float | None = None,
+    temporal: bool = False,
+    coverage: Mapping[str, int] | None = None,
 ) -> None:
     """Fuse relevance, recency, and delivery usage into one recall order.
 
@@ -158,6 +186,13 @@ def _attach_recall_ranking(
     lexicographically; a record missing approved_at ranks oldest. The fused
     score is then degraded by age tier so old records reorder below young
     peers of equal relevance.
+
+    A temporal query ranks relevance on bands rather than raw scores: records
+    within the same `_TEMPORAL_RELEVANCE_BANDS`-th of the best score share a
+    relevance rank, so recency (weighted up for that query) decides among
+    them. BM25 thousandths are nearly a total order, so without the bands
+    "what did we decide recently about deploy windows" served the older
+    decision first because it happened to repeat "deploy".
     """
     if not items:
         return
@@ -169,7 +204,29 @@ def _attach_recall_ranking(
         times = entry.get("times_recalled", 0)
         return times if isinstance(times, int) and not isinstance(times, bool) else 0
 
-    relevance = _competition_ranks(items, lambda item: int(item.get("score", 0) or 0))
+    def _score(item: dict[str, object]) -> int:
+        value = item.get("score", 0)
+        return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+    covered = coverage or {}
+
+    def _coverage(item: dict[str, object]) -> int:
+        return int(covered.get(str(item.get("record_id", "")), 0))
+
+    # Coverage leads, BM25 orders within it (`MemoryRelevance`). For a
+    # temporal query the score is banded against the best score of the same
+    # coverage; higher is better for the ranker, so the band is negated.
+    best_by_coverage: dict[int, int] = {}
+    for item in items:
+        best_by_coverage[_coverage(item)] = max(best_by_coverage.get(_coverage(item), 0), _score(item))
+
+    def _relevance_key(item: dict[str, object]) -> tuple[int, int]:
+        best = best_by_coverage[_coverage(item)]
+        if temporal and best > 0:
+            return (_coverage(item), -(((best - _score(item)) * _TEMPORAL_RELEVANCE_BANDS) // best))
+        return (_coverage(item), _score(item))
+
+    relevance = _competition_ranks(items, _relevance_key)
     recency = _competition_ranks(items, lambda item: str(item.get("approved_at", "")))
     usage_ranks = _competition_ranks(items, lambda item: _usage_bucket(_times_recalled(item)))
     for item in items:
@@ -204,6 +261,7 @@ def _attach_recall_ranking(
             "attention_rank": attention_rank,
             "pinned": record_id in pins,
             "veracity_weight_pct": veracity_pct,
+            "coverage": _coverage(item),
         }
 
 def _usage_bucket(times_recalled: int) -> int:
@@ -447,6 +505,9 @@ def _recall_item(
         "attention_tier": attention_tier,
         "derived_from": _string_list(record.get("derived_from", [])),
         "perspective": _perspective_projection(record.get("perspective")),
+        # Present only on a record that declares one, so every pack built from
+        # records without a subject keeps its exact shape.
+        **({"subject": subject} if (subject := record_subject(record)) else {}),
         **_recall_evidence_fields(evidence),
     }
 
@@ -628,29 +689,208 @@ def normalized_summary_key(summary: str) -> str:
     """
     return " ".join(unicodedata.normalize("NFC", str(summary or "")).lower().split())
 
-def _memory_recall_score(record: dict[str, Any], query: str) -> int:
-    if not query.strip():
-        return 1
-    query_tokens = _memory_tokens(query)
-    if not query_tokens:
-        # The query carries no indexable tokens at all (emoji-only, an
-        # unsupported script, or only sub-length words). Scoring it as zero
-        # overlap used to exclude every record as no_query_overlap and hand
-        # the executor an empty pack; fall back to unqueried recall so the
-        # budget ladder still surfaces approved records.
-        return 1
-    record_tokens = _memory_tokens(
-        " ".join(
-            [
-                str(record.get("summary", "")),
-                str(record.get("record_type", "")),
-                " ".join(_normalize_tags(record.get("tags", []))),
-            ]
-        )
+def record_subject(record: Mapping[str, object]) -> str:
+    """A stored record's subject slug, or "" when it has none.
+
+    A stored value outside the closed shape reads as no subject, so a
+    hand-edited or corrupt field can never merge two records at selection.
+    """
+    value = record.get("subject")
+    return value if isinstance(value, str) and MEMORY_SUBJECT_PATTERN.fullmatch(value) else ""
+
+def normalize_memory_subject(value: object) -> str:
+    """The subject a capture or correction declares: "" for none, else the slug.
+
+    The shape is closed and nothing is rewritten to fit it: an upper-case
+    letter, a space, an underscore, or a 49th character is refused, so the
+    caller learns the rule instead of getting a subject it did not write.
+    """
+    if value is None or value == "":
+        return ""
+    if isinstance(value, str) and MEMORY_SUBJECT_PATTERN.fullmatch(value):
+        return value
+    raise ValueError("subject must match [a-z0-9][a-z0-9-]{0,47}")
+
+def memory_summary_terms(summary: str) -> frozenset[str]:
+    """The stemmed index terms of one summary, as a set (capture's similarity hint)."""
+    return frozenset(_memory_index_terms(str(summary or "")))
+
+def newest_record(records: list[Mapping[str, object]]) -> Mapping[str, object]:
+    """The newest `approved_at` among records; the smaller record id on an equal stamp.
+
+    One rule for "which value of a subject is current", read by recall's
+    subject collapse and by capture's subject hint, so the two never disagree.
+    Approval stamps whole seconds, so two captures in one second tie on the
+    stamp and the record id decides.
+    """
+    # max() returns the first maximal element, so sorting by record id first
+    # makes the smaller id win an equal approved_at.
+    return max(
+        sorted(records, key=lambda record: str(record.get("record_id", ""))),
+        key=lambda record: str(record.get("approved_at", "")),
     )
-    overlap = query_tokens & record_tokens
-    tag_overlap = query_tokens & set(_normalize_tags(record.get("tags", [])))
-    return len(overlap) * 10 + len(tag_overlap) * 5
+
+def _record_relevance_fields(record: Mapping[str, object]) -> dict[str, Counter[str]]:
+    """Term frequencies per BM25 field: summary, tags, record type."""
+    return {
+        "summary": Counter(_memory_index_terms(str(record.get("summary", "")))),
+        "tags": Counter(_memory_index_terms(" ".join(_normalize_tags(record.get("tags", []))))),
+        "record_type": Counter(_memory_index_terms(str(record.get("record_type", "")))),
+    }
+
+def _memory_query_tokens(query: str) -> list[str]:
+    """The query's index tokens with the closed lists removed (unstemmed).
+
+    Two exceptions keep a listed word: the raw query writes it all in capitals
+    or capitalized mid-sentence (`_kept_listed_words`), and nothing else is
+    left -- "what is it?" is then scored on "what" rather than as no query.
+    """
+    raw = str(query or "")
+    if not raw.strip():
+        return []
+    return _memory_token_list(raw, query=True, kept=_kept_listed_words(raw)) or _memory_token_list(raw)
+
+class MemoryRelevance(NamedTuple):
+    """Per-record relevance of one selection, in record order.
+
+    ``coverage`` is the primary relevance key: twice the number of distinct
+    query terms a record matches in its summary or tags, plus one for each of
+    them that is one of its tags (the old overlap scorer's 10-per-term,
+    5-per-tag shape, without the record type). ``scores`` is BM25 in integer
+    thousandths and orders records only within an equal coverage. ``unstemmed``
+    says whether the record shares an unstemmed query token in its summary or
+    tags.
+    """
+
+    scores: list[int]
+    unstemmed: list[bool]
+    coverage: list[int]
+
+
+def _bm25_contributions(
+    document: Mapping[str, Counter[str]],
+    terms: Iterable[str],
+    *,
+    norm: float,
+    frequency: Mapping[str, int],
+    count: int,
+) -> list[int]:
+    """Each matching term's BM25F contribution to one record, in integer millionths, in term order.
+
+    Rounding each term before the sum is what makes the total independent of
+    the order terms arrive in and of the host's float rounding: integers add
+    exactly. A test passes the same terms in permuted orders.
+    """
+    contributions: list[int] = []
+    for term in terms:
+        weighted = (
+            document["summary"][term] / norm
+            + _RECALL_BM25_TAG_WEIGHT * document["tags"][term]
+            + _RECALL_BM25_RECORD_TYPE_WEIGHT * document["record_type"][term]
+        )
+        if weighted <= 0:
+            continue
+        holders = frequency[term]
+        idf = math.log(1 + (count - holders + 0.5) / (holders + 0.5))
+        contributions.append(round(idf * weighted * (_RECALL_BM25_K1 + 1) / (weighted + _RECALL_BM25_K1) * 1_000_000))
+    return contributions
+
+
+def _memory_relevance(records: list[dict[str, Any]], query: str) -> MemoryRelevance:
+    """BM25 relevance of each record to the query against this candidate set,
+    ordered first by query-term coverage.
+
+    The corpus is the records passed in -- the eligible candidates of one
+    selection -- so document frequencies and the average summary length are
+    properties of the store being recalled from, and the same store and query
+    always score the same. A word most records share weighs little; a word one
+    record holds weighs a lot. The old score counted every shared word alike,
+    so a chat message sharing "the plan for" with an offsite note outranked the
+    one record about the backup it asked about.
+
+    Rarity alone is unbounded, though: in a store of statements any chat word
+    the closed lists miss ("remind", 언제쯤이야 before the prefix rule) is held by
+    one record and outweighs a topic word several records share. So coverage
+    comes first (`MemoryRelevance.coverage`): a record matching the topic word
+    and its tag outranks one matching a single stray word however rare, and
+    BM25 orders records only within an equal coverage. Measured on the review's
+    fresh probes (holdout-2): with the earlier lists, coverage alone took the
+    English cases ("can you remind me how we deploy?", "quick question: do we
+    deploy on fridays?") but not the Korean, Japanese or Chinese ones, where a
+    stray bigram and a topic bigram both count once and no English tag helps;
+    with the closed lists and no coverage, the Japanese case still put
+    "どうやるのか分からない時は..." above the deploy record, on the leftover
+    bigrams やる and るの. Both together held every case. A tag-match flag
+    instead of the per-tag count measured the same; an idf cap relative to
+    the best tag-matched term kept the Japanese miss.
+
+    The query loses its function words and chat fillers first
+    (`_memory_query_tokens`): "how", "who", 어떻게 or 누가 is rare in stored
+    statements, and with them in, "how do we deploy?" ranked "How expenses are
+    filed ..." above every deploy record.
+
+    Fields: summary hits are length-normalized, a tag hit weighs
+    `_RECALL_BM25_TAG_WEIGHT`, and the weighted counts saturate together
+    (BM25F). The record type weighs `_RECALL_BM25_RECORD_TYPE_WEIGHT`, but only
+    in a record that also has a summary or tag hit, and never in coverage: a
+    type is a category, so "any facts about deploys?" must not pull in every
+    fact record.
+
+    Length is counted in whole multiples of the candidates' average summary
+    length, never below one, rather than as a continuous ratio. Continuous
+    normalization reorders two records covering the same query terms by a
+    one-word length difference, which overrode the recency tie-break the
+    `record_limit_truncation_reports_over_budget` recall case pins. Counted in
+    whole multiples, two near-average records tie and recency and usage still
+    decide them, while a record at least twice the average is discounted: a
+    long checklist that mentions a word once no longer beats the short record
+    about that word. The step is a cliff, not a slope: a record at 1.99 times
+    the average is not discounted at all, and adding or removing short records
+    moves the average and so can move a record across it. CJK text counts its
+    run and its bigrams as tokens, so a Korean summary is "longer" than an
+    English one of the same meaning; both effects only reorder records whose
+    other evidence ties. Integer arithmetic decides the multiple.
+
+    Each term's contribution is rounded to integer millionths before it is
+    added (`_bm25_contributions`). A score of 0 means no query term matched;
+    any match scores at least 1. No query, or one with no terms at all, scores every
+    record 1 at coverage 0 and counts as matched.
+    """
+    query_tokens = _memory_query_tokens(query)
+    query_terms = sorted({_stem_memory_token(token) for token in query_tokens})
+    if not query_terms:
+        return MemoryRelevance([1] * len(records), [True] * len(records), [0] * len(records))
+    query_set = set(query_terms)
+    unstemmed_query = set(query_tokens)
+    documents = [_record_relevance_fields(record) for record in records]
+    count = len(documents)
+    total_length = sum(sum(document["summary"].values()) for document in documents)
+    frequency: Counter[str] = Counter()
+    for document in documents:
+        frequency.update(query_set & (set(document["summary"]) | set(document["tags"]) | set(document["record_type"])))
+    scores: list[int] = []
+    unstemmed: list[bool] = []
+    coverage: list[int] = []
+    for record, document in zip(records, documents):
+        matched = [term for term in query_terms if document["summary"][term] or document["tags"][term]]
+        if not matched:
+            scores.append(0)
+            unstemmed.append(False)
+            coverage.append(0)
+            continue
+        coverage.append(2 * len(matched) + sum(1 for term in matched if document["tags"][term]))
+        length = sum(document["summary"].values())
+        multiple = max(1, (length * count) // total_length) if total_length else 1
+        norm = 1 - _RECALL_BM25_B + _RECALL_BM25_B * multiple
+        contributions = _bm25_contributions(document, query_terms, norm=norm, frequency=frequency, count=count)
+        scores.append(max(1, (sum(contributions) + 500) // (1_000_000 // _RECALL_SCORE_SCALE)))
+        content = _memory_tokens(str(record.get("summary", ""))) | _memory_tokens(" ".join(_normalize_tags(record.get("tags", []))))
+        unstemmed.append(bool(unstemmed_query & content))
+    return MemoryRelevance(scores, unstemmed, coverage)
+
+def _memory_relevance_scores(records: list[dict[str, Any]], query: str) -> list[int]:
+    """The scores of `_memory_relevance`."""
+    return _memory_relevance(records, query).scores
 
 # Latin letters past ASCII: Latin-1 letters (minus the multiplication and
 # division signs), Latin Extended-A/B and Latin Extended Additional, plus the
@@ -675,8 +915,90 @@ _MEMORY_SHORT_STOPWORDS = frozenset(
 
 _MEMORY_CJK_RUN = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7a3]+")
 
-def _memory_tokens(value: str) -> set[str]:
-    """Index tokens for recall scoring, covering ASCII and CJK text.
+# Query-side function words: a question's interrogatives, auxiliaries,
+# pronouns, articles and common prepositions. Records are statements, so these
+# words are rare in a store and idf would make them the heaviest words in the
+# question ("how do we deploy?" led with "How expenses are filed ..."). They
+# are removed from the query only -- a record keeps every word -- so they
+# neither score nor count as overlap. Closed and English plus Korean on
+# purpose, like `_MEMORY_SHORT_STOPWORDS`: this is not a language model, and a
+# word not listed scores normally. "may" is left out because it is also a
+# month name.
+_QUERY_FUNCTION_WORDS = frozenset(
+    {
+        "how", "what", "when", "where", "which", "who", "whom", "whose", "why",
+        "do", "does", "did", "am", "is", "are", "was", "were", "be", "been", "being",
+        "have", "has", "had", "can", "could", "shall", "should", "will", "would", "might", "must",
+        "me", "my", "mine", "we", "us", "our", "ours", "you", "your", "yours", "he", "him", "his",
+        "she", "her", "hers", "they", "them", "their", "theirs", "it", "its",
+        "the", "this", "that", "these", "those", "any", "some",
+        "about", "for", "from", "of", "to", "in", "on", "at", "by", "with", "into", "onto",
+        "and", "or", "but", "if", "so", "than", "then",
+        "please", "hey", "hello", "thanks",
+    }
+)
+
+# Query-side chat fillers: words a person wraps a question in ("can you remind
+# me", "quick question:", "does anyone know") that carry no topic. Same rule as
+# `_QUERY_FUNCTION_WORDS` -- query side only, closed, a word not listed scores
+# normally -- kept apart so the two lists stay reviewable.
+_QUERY_CHAT_FILLERS = frozenset(
+    {
+        "remind", "reminder", "remember", "quick", "question", "questions", "anyone", "anybody",
+        "someone", "somebody", "need", "needs", "tell", "know", "wondering", "wonder", "curious",
+        "just", "again", "also", "ask", "okay", "sorry", "thank",
+    }
+)
+
+# What the query drops by word, function words and fillers together.
+_QUERY_DROPPED_WORDS = _QUERY_FUNCTION_WORDS | _QUERY_CHAT_FILLERS
+
+# Korean runs matched whole, never by bigram: a bare verb ending carries no
+# topic. Interrogatives are matched by prefix instead (below).
+_QUERY_FUNCTION_RUNS = frozenset(
+    {
+        "누가", "누구", "누구야", "누구지", "누구예요", "누구인가요", "무엇", "무엇을", "무엇이", "무엇인가요",
+        "뭐야", "뭐지", "뭐였지", "뭐였더라", "뭐예요", "뭐에요", "무슨", "어떤", "어떻게", "어때", "어때요",
+        "어디", "어디야", "어디서", "어디에", "언제", "언제야", "언제지", "얼마나",
+        "해요", "했지", "했어", "했어요", "하지", "하나요", "합니까", "할까", "할까요", "되나요", "됐지",
+        "있어", "있나요", "있지", "없어", "인가요", "이야", "이지", "일까", "알려줘", "알려줘요", "말해줘", "해줘",
+    }
+)
+
+# A Korean run that starts with an interrogative is dropped whole, whatever
+# particle or ending follows it (언제쯤이야, 누가요, 어떻게든): the endings are
+# open-ended, the interrogative stems are not. It costs the rare content word
+# that shares a stem (왜곡, 몇몇), on the query side only.
+_QUERY_FUNCTION_RUN_PREFIXES = ("언제", "어떻게", "누가", "누구", "어디", "뭐", "무슨", "몇", "왜")
+
+# Japanese and Chinese interrogatives, cut out of a query's CJK run before it
+# is split into bigrams, so no bigram crosses or contains them: 怎么部署 keeps
+# 部署 and loses 怎么 and 么部. Longest first, so 为什么 is cut before 什么.
+_QUERY_FUNCTION_CJK = tuple(
+    sorted(
+        {
+            "どうやって", "どう", "どの", "どれ", "どこ", "いつ", "誰", "何", "なぜ", "なに", "なん",
+            "为什么", "怎么", "怎样", "什么", "哪里", "哪儿", "哪个", "谁", "多少", "几", "吗", "呢",
+        },
+        key=lambda word: (-len(word), word),
+    )
+)
+
+# A listed word still scores when the raw query writes it all in capitals or
+# capitalized mid-sentence ("WHO?", "ask Will", "CAN logger"): case is the one
+# deterministic sign that it names something.
+_QUERY_RAW_WORD = re.compile(r"[A-Za-z]+")
+
+_QUERY_SENTENCE_BREAKS = frozenset(".!?:;\n")
+
+_MEMORY_STEM_VOWELS = frozenset("aeiouy")
+
+# After the one plural rule, at most one of these comes off, tried in this
+# order; the number is the shortest stem the suffix may leave behind.
+_MEMORY_STEM_SUFFIXES = (("ment", 4), ("ing", 3), ("ion", 4), ("ed", 3), ("ly", 4))
+
+def _memory_token_list(value: str, *, query: bool = False, kept: frozenset[str] = frozenset()) -> list[str]:
+    """Index tokens for recall scoring, with repeats, covering ASCII and CJK text.
 
     ASCII words of three characters or more are indexed whole. Two-character
     words are indexed unless they are one of the named function words. The old
@@ -688,31 +1010,133 @@ def _memory_tokens(value: str) -> set[str]:
     carried `ci` as a tag, which the tag bonus could not rescue because the
     query token had already been dropped.
 
-    CJK runs are indexed as the whole
-    run plus its character bigrams: Korean particles glue to the noun
-    ("배포는"), so whole-word overlap alone would miss "배포" in a query.
-    The previous ASCII-only split tokenized any CJK query to the empty set,
-    which excluded every record as no_query_overlap and silently emptied
-    recall packs for projects that chat in Korean, Japanese, or Chinese.
+    CJK runs are indexed as the whole run plus its character bigrams: Korean
+    particles glue to the noun ("배포는"), so whole-word overlap alone would
+    miss "배포" in a query. The previous ASCII-only split tokenized any CJK
+    query to the empty set, which excluded every record as no_query_overlap
+    and silently emptied recall packs for projects that chat in Korean,
+    Japanese, or Chinese. A two-character run is its own only bigram and is
+    listed once.
 
     Accented Latin words ("déploiement") are indexed whole and, beside that,
     accent-folded ("deploiement"), so a query typed with or without accents
     overlaps the same record. Tokens are computed per call and never stored.
+    Repeats are kept because BM25 counts term frequency and summary length.
+    With ``query=True`` the closed lists are left out: words in
+    `_QUERY_DROPPED_WORDS` (unless in ``kept``), Korean runs in
+    `_QUERY_FUNCTION_RUNS` or starting with `_QUERY_FUNCTION_RUN_PREFIXES`,
+    and `_QUERY_FUNCTION_CJK` cut out of a run before its bigrams are taken.
+    Records are always tokenized in full.
     """
     lowered = unicodedata.normalize("NFC", value).lower()
-    tokens = set()
+    tokens: list[str] = []
     for word in _MEMORY_WORD_TOKEN.findall(lowered):
-        tokens.add(word)
+        if query and word in _QUERY_DROPPED_WORDS and word not in kept:
+            continue
+        tokens.append(word)
         if not word.isascii():
             folded = "".join(char for char in unicodedata.normalize("NFKD", word) if not unicodedata.combining(char))
             if len(folded) >= 3:
-                tokens.add(folded)
-    tokens.update(token for token in _MEMORY_SHORT_ASCII_TOKEN.findall(lowered) if token not in _MEMORY_SHORT_STOPWORDS)
+                tokens.append(folded)
+    tokens.extend(
+        token
+        for token in _MEMORY_SHORT_ASCII_TOKEN.findall(lowered)
+        if token not in _MEMORY_SHORT_STOPWORDS and not (query and token in _QUERY_DROPPED_WORDS and token not in kept)
+    )
     for run in _MEMORY_CJK_RUN.findall(lowered):
-        if len(run) >= 2:
-            tokens.add(run)
-        tokens.update(run[index : index + 2] for index in range(len(run) - 1))
+        if query and (run in _QUERY_FUNCTION_RUNS or run.startswith(_QUERY_FUNCTION_RUN_PREFIXES)):
+            continue
+        for segment in _cut_cjk_function_words(run) if query else (run,):
+            if len(segment) > 2:
+                tokens.append(segment)
+            tokens.extend(segment[index : index + 2] for index in range(len(segment) - 1))
     return tokens
+
+
+def _cut_cjk_function_words(run: str) -> list[str]:
+    """The pieces of a CJK run left after cutting out `_QUERY_FUNCTION_CJK` words."""
+    pieces: list[str] = []
+    current = ""
+    index = 0
+    while index < len(run):
+        word = next((word for word in _QUERY_FUNCTION_CJK if run.startswith(word, index)), "")
+        if word:
+            if current:
+                pieces.append(current)
+            current = ""
+            index += len(word)
+            continue
+        current += run[index]
+        index += 1
+    if current:
+        pieces.append(current)
+    return pieces
+
+
+def _kept_listed_words(raw: str) -> frozenset[str]:
+    """Listed words the raw query writes all in capitals or capitalized mid-sentence."""
+    kept: set[str] = set()
+    for match in _QUERY_RAW_WORD.finditer(raw):
+        word = match.group()
+        lowered = word.lower()
+        if lowered not in _QUERY_DROPPED_WORDS:
+            continue
+        if len(word) >= 2 and word.isupper():
+            kept.add(lowered)
+            continue
+        if word[0].isupper() and word[1:].islower():
+            before = raw[: match.start()].rstrip()
+            if before and before[-1] not in _QUERY_SENTENCE_BREAKS:
+                kept.add(lowered)
+    return frozenset(kept)
+
+def _memory_tokens(value: str) -> set[str]:
+    """The distinct, unstemmed tokens of `_memory_token_list`."""
+    return set(_memory_token_list(value))
+
+def _stem_memory_token(token: str) -> str:
+    """Light English suffix stripping, applied alike to a query and a record.
+
+    Only an all-ASCII-letter token of four or more letters changes: CJK runs
+    and bigrams, accented words, numbers, paths, and hyphenated or underscored
+    compounds pass through as they are. One plural rule (-ies; -sses, -ches,
+    -shes, -xes; then a plain -s that is not -ss, -us or -is), then at most one
+    of -ment, -ing, -ion, -ed, -ly, then a final e on a word longer than four
+    letters: deploy, deploys, deployed, deploying and deployment all become
+    `deploy`; release, releases, released and releasing all become `releas`.
+    A suffix comes off only when the stem left has a vowel and at least the
+    length `_MEMORY_STEM_SUFFIXES` names, which keeps string, thing, apply,
+    reply and region whole. After -ing or -ed a doubled final consonant other
+    than l, s or z is undoubled (running -> run, committed -> commit).
+
+    It is a stemmer, not a dictionary: some unrelated words meet (news reads
+    as new, settings as set), and the recall suite pins that cost.
+    """
+    if len(token) < 4 or not token.isascii() or not token.isalpha():
+        return token
+    word = token
+    if word.endswith("ies") and len(word) > 4:
+        word = word[:-3] + "y"
+    elif word.endswith(("sses", "ches", "shes", "xes")):
+        word = word[:-2]
+    elif word.endswith("s") and not word.endswith(("ss", "us", "is")):
+        word = word[:-1]
+    for suffix, shortest_stem in _MEMORY_STEM_SUFFIXES:
+        if not word.endswith(suffix):
+            continue
+        stem = word[: -len(suffix)]
+        if len(stem) >= shortest_stem and any(char in _MEMORY_STEM_VOWELS for char in stem):
+            word = stem
+            if suffix in ("ing", "ed") and len(word) >= 4 and word[-1] == word[-2] and word[-1] not in "lsz":
+                word = word[:-1]
+        break
+    if word.endswith("e") and len(word) > 4:
+        word = word[:-1]
+    return word
+
+def _memory_index_terms(value: str) -> list[str]:
+    """`_memory_token_list` with each token stemmed: what relevance compares."""
+    return [_stem_memory_token(token) for token in _memory_token_list(value)]
 
 def _record_staleness(
     record: dict[str, Any],
@@ -997,6 +1421,7 @@ __all__ = [
     "ADVISORY_FRESHNESS_REASONS",
     "DEFAULT_MEMORY_ATTENTION_TIER",
     "MAX_RETENTION_DAYS",
+    "MEMORY_SUBJECT_PATTERN",
     "MEMORY_ATTENTION_TIERS",
     "MEMORY_RESOLUTIONS",
     "PROJECT_MEMORY_RECALL_PACK_SCHEMA_VERSION",
@@ -1023,10 +1448,22 @@ __all__ = [
     "_MEMORY_WORD_TOKEN",
     "_OPEN_ASK_DAYS",
     "_OPEN_MAX_DAYS",
+    "_RECALL_BM25_B",
+    "_RECALL_BM25_K1",
+    "_RECALL_BM25_RECORD_TYPE_WEIGHT",
+    "_RECALL_BM25_TAG_WEIGHT",
     "_RECALL_RRF_K",
     "_RECALL_RRF_WEIGHTS",
     "_REVIEW_DEFAULT_DAYS",
     "_REVIEW_DUE_SOON_DAYS",
+    "_RECALL_SCORE_SCALE",
+    "_TEMPORAL_RELEVANCE_BANDS",
+    "_QUERY_FUNCTION_RUNS",
+    "_QUERY_CHAT_FILLERS",
+    "_QUERY_DROPPED_WORDS",
+    "_QUERY_FUNCTION_RUN_PREFIXES",
+    "_QUERY_FUNCTION_CJK",
+    "_QUERY_FUNCTION_WORDS",
     "_SAFE_TAG",
     "_SOURCE_EVIDENCE_MAX_BYTES",
     "_TEMPORAL_QUERY_CUES",
@@ -1040,7 +1477,15 @@ __all__ = [
     "_empty_recall_pack",
     "_freshness_warnings",
     "_local_source_digest",
-    "_memory_recall_score",
+    "_memory_index_terms",
+    "_memory_query_tokens",
+    "_memory_relevance",
+    "_memory_relevance_scores",
+    "MemoryRelevance",
+    "_bm25_contributions",
+    "_kept_listed_words",
+    "_cut_cjk_function_words",
+    "_memory_token_list",
     "_memory_tokens",
     "_normalize_evaluator_timestamps",
     "_normalize_scope",
@@ -1067,10 +1512,15 @@ __all__ = [
     "_retention_class",
     "_scope",
     "_source_evidence_state",
+    "_stem_memory_token",
     "_string_list",
     "_usage_bucket",
     "freshness_reason_detail",
+    "memory_summary_terms",
     "normalize_memory_attention_tier",
+    "normalize_memory_subject",
     "open_resolution_marker",
     "record_attention_tier",
+    "newest_record",
+    "record_subject",
 ]

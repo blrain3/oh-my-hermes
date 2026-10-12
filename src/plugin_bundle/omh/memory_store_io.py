@@ -29,6 +29,7 @@ from .memory_governance import PRINCIPAL_PROJECT_MEMORY_RECORD_SCHEMA_VERSION, c
 from .memory_principals import memory_identity_errors
 from .memory_recall_support import (
     LEGACY_PROJECT_MEMORY_RECORD_SCHEMA_VERSION,
+    MEMORY_SUBJECT_PATTERN,
     PROJECT_MEMORY_RECORD_SCHEMA_VERSION,
     _redact_admitted_text,
 )
@@ -67,6 +68,7 @@ _PROJECT_MEMORY_RECORD_KEYS = {
     "redaction_policy",
     "claim_boundary",
     "identity",
+    "subject",
 }
 _HANDOFF_CONTEXT_SCOPE_KEYS = {"kind", "ref"}
 # Perspective is honcho's peer paradigm reinterpreted deterministically: an
@@ -420,6 +422,8 @@ def validate_project_memory_record(value: Any, *, label: str = "project_memory_r
     _validate_context_scope(value.get("scope"), errors, f"{label}.scope")
     if "perspective" in value:
         _validate_perspective(value.get("perspective"), errors, f"{label}.perspective", require_observed=True)
+    if "subject" in value and not (isinstance(value["subject"], str) and MEMORY_SUBJECT_PATTERN.fullmatch(value["subject"])):
+        errors.append(f"{label}.subject must match [a-z0-9][a-z0-9-]{{0,47}}")
     if value.get("redaction_policy") != "metadata_only":
         errors.append(f"{label}.redaction_policy must be metadata_only")
     if _contains_sensitive_text(value):

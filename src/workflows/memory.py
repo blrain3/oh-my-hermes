@@ -50,6 +50,7 @@ from ..plugin_bundle.omh.memory_recall_support import (
     DEFAULT_MEMORY_ATTENTION_TIER as DEFAULT_MEMORY_ATTENTION_TIER,
     MAX_RETENTION_DAYS as MAX_RETENTION_DAYS,
     MEMORY_ATTENTION_TIERS as MEMORY_ATTENTION_TIERS,
+    MEMORY_SUBJECT_PATTERN as MEMORY_SUBJECT_PATTERN,
     PROJECT_MEMORY_RECALL_PACK_SCHEMA_VERSION as PROJECT_MEMORY_RECALL_PACK_SCHEMA_VERSION,
     _ADMISSION_VERACITY_DEFAULT_PCT as _ADMISSION_VERACITY_DEFAULT_PCT,
     _ADMISSION_VERACITY_WEIGHT_PCT as _ADMISSION_VERACITY_WEIGHT_PCT,
@@ -91,7 +92,7 @@ from ..plugin_bundle.omh.memory_recall_support import (
     _empty_recall_pack as _empty_recall_pack,
     _freshness_warnings as _freshness_warnings,
     _local_source_digest as _local_source_digest,
-    _memory_recall_score as _memory_recall_score,
+    _memory_relevance_scores as _memory_relevance_scores,
     _memory_tokens as _memory_tokens,
     _normalize_evaluator_timestamps as _normalize_evaluator_timestamps,
     _normalize_scope as _normalize_scope,
@@ -279,6 +280,8 @@ _PROJECT_MEMORY_RECALL_ITEM_KEYS = {
     "attention_tier",
     "derived_from",
     "perspective",
+    # Present only on a record that declares a subject (closed slug shape).
+    "subject",
     "revision",
     "admission_mode",
     "source_class",
@@ -299,6 +302,7 @@ _RECALL_RANKING_KEYS = {
     "attention_rank",
     "pinned",
     "veracity_weight_pct",
+    "coverage",
 }
 # Admission-mode veracity, mnemosyne-style: a human-reviewed record outranks
 # an auto-safe one of equal relevance/age. The gap is deliberately small --
@@ -412,6 +416,9 @@ _PROJECT_MEMORY_EXCLUDED_KEYS = {
     "staleness",
     "sibling_included",
     "duplicate_of",
+    # A `superseded_by_subject` exclusion names the record serving the subject.
+    "superseded_by",
+    "subject",
     "revision",
     "admission_mode",
     "source_class",
@@ -422,6 +429,9 @@ _PROJECT_MEMORY_EXCLUDED_KEYS = {
     "replay_evaluation",
 }
 _PROJECT_MEMORY_TASK_REF_KEYS = {"sha256", "length", "query_supplied"}
+# The record-id shape a recall exclusion may name in `superseded_by`; a
+# redacted label ("redacted") also fits.
+_SAFE_RECALL_RECORD_ID = re.compile(r"[A-Za-z0-9_.:-]{1,120}")
 # Source-evidence freshness. Time deadlines alone cannot notice that the file
 # a record cites was rewritten the day after approval, so a record may carry
 # the digest of the local source observed at capture. Comparing that digest
@@ -3495,6 +3505,12 @@ def _validate_context_list(
                 _validate_replay_evaluation(nested, errors, nested_label)
             elif key == "revalidation_evidence" and isinstance(nested, dict):
                 _validate_context_map(nested, {"deadline"}, errors, nested_label)
+            elif key == "subject":
+                if not (isinstance(nested, str) and MEMORY_SUBJECT_PATTERN.fullmatch(nested)):
+                    errors.append(f"{nested_label} must match [a-z0-9][a-z0-9-]{{0,47}}")
+            elif key == "superseded_by":
+                if not (isinstance(nested, str) and _SAFE_RECALL_RECORD_ID.fullmatch(nested)):
+                    errors.append(f"{nested_label} must be a record id")
             elif isinstance(nested, (str, int, bool)) or nested is None:
                 continue
             else:

@@ -2091,6 +2091,9 @@ def _compact_memory_recall_item(item: dict[str, Any]) -> dict[str, Any]:
         "ranking": _compact_ranking(item.get("ranking")),
         "derived_from": [str(ref) for ref in (item.get("derived_from") if isinstance(item.get("derived_from"), list) else []) if str(ref)][:8],
         "perspective": _compact_perspective(item.get("perspective")),
+        # The subject survives compaction when the record declares one, for the
+        # same parity reason: it explains why another value of it is absent.
+        **({"subject": str(item["subject"])} if isinstance(item.get("subject"), str) and item["subject"] else {}),
         **_compact_memory_replay_fields(item),
     }
 
@@ -2101,7 +2104,7 @@ def _compact_ranking(value: Any) -> dict[str, Any]:
         return {}
     compacted: dict[str, Any] = {
         key: int(ranking.get(key, 0) or 0)
-        for key in ("rrf_score_micro", "decayed_score_micro", "relevance_rank", "recency_rank", "usage_rank", "times_recalled", "age_tier", "attention_rank", "veracity_weight_pct")
+        for key in ("rrf_score_micro", "decayed_score_micro", "relevance_rank", "recency_rank", "usage_rank", "times_recalled", "age_tier", "attention_rank", "veracity_weight_pct", "coverage")
     }
     compacted["pinned"] = bool(ranking.get("pinned", False))
     return compacted
@@ -2125,6 +2128,11 @@ def _compact_memory_recall_exclusion(item: dict[str, Any]) -> dict[str, Any]:
             key: str(item.get("staleness", {}).get(key, ""))
             for key in ("state", "stale_after", "expires_at")
             if isinstance(item.get("staleness"), dict) and key in item.get("staleness", {})
+        },
+        **{
+            key: str(item[key])
+            for key in ("superseded_by", "subject")
+            if isinstance(item.get(key), str) and item[key]
         },
         **_compact_memory_replay_fields(item),
     }
