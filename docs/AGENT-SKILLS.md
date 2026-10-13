@@ -264,6 +264,52 @@ plus its optional trigger/alias tail exceeds that budget, this target drops the
 tail; an over-budget base description fails generation. Hermes bytes are pinned
 and unchanged.
 
+## Host-discovery evidence layer
+
+`omh.quality.agent_skills_discovery` records what a host actually does with an
+installed pack. Every probe is described by a checked-in descriptor (executable
+requirement, version command, isolated layout, non-mutating discovery command,
+timeout, cleanup rule, credential requirement) and produces a receipt bound to
+the host version, operating system, scope, target path, adapter `source_digest`,
+pack `catalog_revision`, command identity, timestamps, exit status, and cleanup
+result.
+
+Stages are `installed`, `discovered`, `nominated`, `loaded`, and `executed`,
+and no stage is ever inferred from an earlier one. A missing binary, an
+undocumented probe surface, a stale adapter digest, a credential
+requirement, a timeout, or malformed output fails closed to an explicit HOLD
+or not-observed outcome. `probe_unsupported` means no documented
+credential-free discovery probe is known for that host today; it is not a
+claim that the host cannot discover Agent Skills. Model-mediated enumeration
+(a host agent listing the pack through its own file tools) is recorded as
+`model_mediated` mechanism evidence and is never filed as host-native
+discovery. Real-host probes are opt-in, run in a temporary project root,
+perform no intentional home or configuration writes, and attempt cleanup
+with the result recorded on the receipt. Fixture-backed tests validate the
+evidence-layer contract; real-host verification remains limited to the
+explicitly listed observations below.
+
+A receipt is bound to the pack `catalog_revision` and `source_digest` it
+recorded: regenerating the pack (revision or digest change) makes earlier
+receipts stale for the new pack, and the matrix reports `stale`. A receipt
+is likewise bound to the host version that produced it and does not
+generalize to other versions.
+
+**Observed receipts, 2026-10-13** (probe host: Linux x86_64; pack revision at
+probe time recorded per receipt):
+
+| Host | Binary | Result | Evidence class |
+|---|---|---|---|
+| Claude Code | 2.1.296 | SDK probe returned HTTP 401; authentication root cause not investigated | not observed this run; the 2.1.270 observation above stands |
+| Codex | 0.158.0 | Agent enumerated the pack from `.agents/skills/` via its own file search; no host-native discovery command exists in this version | discovered_model_mediated |
+| Cursor | absent | Binary not installed on probe host | not observed (missing binary) |
+| opencode | v2.0.27 | No authenticated provider on probe host | not observed (credential-dependent) |
+| OpenClaw | absent | Binary not installed on probe host | not observed (missing binary) |
+| pi | absent | Binary not installed on probe host | not observed (missing binary) |
+
+A fresh receipt binds to the host version and adapter digest that produced it;
+it is not a guarantee for later host versions.
+
 ## Non-portable capabilities
 
 - **`omh_*` RPC tools** such as todo, delegation-route, and run-summary tools
