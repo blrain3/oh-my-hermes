@@ -22,7 +22,7 @@ decode: Callable[[str], Json] = json.loads
 def receipt(home: Path) -> dict[str, Json]:
     home.mkdir()
     provider = OmhMemoryProvider(home)
-    provider.initialize("session-a", cwd=str(home.parent))
+    provider.initialize("session-a", platform="cli", cwd=str(home.parent))
     _ = provider.prefetch()
     value = decode(json.dumps(provider.latest_prefetch_receipt()))
     assert isinstance(value, dict)
@@ -35,12 +35,12 @@ class PrefetchReceiptLimitsTests(unittest.TestCase):
             home = Path(temporary) / "omh"
             home.mkdir()
             provider = OmhMemoryProvider(home)
-            provider.initialize("session-a", cwd=temporary)
+            provider.initialize("session-a", platform="cli", cwd=temporary)
             provider.queue_prefetch("Previous session query")
             _ = provider.prefetch()
             self.assertIsNotNone(provider.latest_prefetch_receipt())
 
-            provider.initialize("session-b", cwd=temporary)
+            provider.initialize("session-b", platform="cli", cwd=temporary)
 
             self.assertIsNone(provider.latest_prefetch_receipt())
             self.assertIsNone(provider.recall_status())

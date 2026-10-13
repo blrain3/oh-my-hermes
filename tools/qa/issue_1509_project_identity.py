@@ -54,7 +54,7 @@ def exercise(scratch: Path) -> dict[str, object]:
         pack = cli(root, "recall")
         assert {row["record_id"] for row in pack["included_records"]} == {included}
         provider = OmhMemoryProvider(user)
-        provider.initialize("qa-session", cwd=root, agent_context="subagent")
+        provider.initialize("qa-session", cwd=root, platform="cli", agent_context="primary")
         text = provider.prefetch()
         assert included in text and excluded not in text
         receipt = provider.latest_prefetch_receipt()
@@ -90,9 +90,9 @@ def exercise(scratch: Path) -> dict[str, object]:
     assert cli(local_repos[0], "project-identity", "show")["identity"] != cli(local_repos[1], "project-identity", "show")["identity"]
     local_id = approve(local_repos[0], "local endpoint sentinel", home=local_user)
     local_provider = OmhMemoryProvider(local_user)
-    local_provider.initialize("local", cwd=local_repos[0], agent_context="subagent")
+    local_provider.initialize("local", cwd=local_repos[0], platform="cli", agent_context="primary")
     assert local_id in local_provider.prefetch()
-    local_provider.initialize("local", cwd=local_repos[1], agent_context="subagent")
+    local_provider.initialize("local", cwd=local_repos[1], platform="cli", agent_context="primary")
     assert local_id not in local_provider.prefetch()
     local_provider.shutdown()
     assert cli(local_repos[1], "recall", home=local_user)["included_records"] == []
@@ -109,7 +109,7 @@ def exercise(scratch: Path) -> dict[str, object]:
     receipt = cli(migration_root, "project-identity", "migrate", "--approve", report["report_digest"], home=migration_user)
     assert len(receipt["successors"]) == 2
     provider = OmhMemoryProvider(migration_user)
-    provider.initialize("migration-session", cwd=migration_root, agent_context="subagent")
+    provider.initialize("migration-session", cwd=migration_root, platform="cli", agent_context="primary")
     text = provider.prefetch()
     assert all(record_id in text for record_id in legacy_ids)
     provider.shutdown()

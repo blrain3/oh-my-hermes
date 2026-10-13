@@ -61,7 +61,7 @@ class MemoryRecallIncidentTests(unittest.TestCase):
         """The actual provider lifecycle persists the receipt this profile's diagnosis reads."""
         assert self.root is not None
         live = OmhMemoryProvider(self.paths.omh_home, hermes_home=self.paths.hermes_home)
-        live.initialize(session_id, hermes_home=str(self.paths.hermes_home), agent_context='primary', cwd=str(self.root))
+        live.initialize(session_id, platform="cli", hermes_home=str(self.paths.hermes_home), agent_context='primary', cwd=str(self.root))
         live.queue_prefetch('')
         live.prefetch('')
         receipt = live.latest_prefetch_receipt()

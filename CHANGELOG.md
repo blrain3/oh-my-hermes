@@ -4,6 +4,40 @@ All notable changes will be documented here.
 
 ## Unreleased
 
+- **OMH memory is recalled on the TUI and Desktop, outside a repository, and
+  never past Hermes' spill cap.** The memory provider treated every `platform`
+  other than `cli` as a shared surface, and a shared surface denies every
+  identity-unbound record, and Hermes never passes a principal, so a model
+  capture was never recalled on the TUI or Desktop, wherever it was made.
+  Provider `initialize` now gives each session one
+  surface class from Hermes' own `platform` and `agent_context`, failing closed
+  for anything unknown: `operator_console` (`cli`, `tui`, `desktop`, which reach
+  the agent through an OS, dashboard or Desktop-token login that already grants
+  full control; Kanban workers arrive as `cli`), `shared` (every gateway,
+  `api_server`, `webhook`, `relay`, `acp`, an empty or unknown platform) and
+  `background` (a non-primary `agent_context` such as `cron`). A
+  `shared_surface=True` kwarg only tightens. A console reads exactly as the CLI
+  did; shared and background reads are unchanged. `omh_memory` `capture` and
+  `demote` now read the session lens like the lifecycle actions:
+  `shared_surface_writes_refused` on a shared surface, `writes_disabled` in a
+  background run and `session_lens_unavailable` with no lens, each writing
+  nothing and saying so. The session lens publishes `surface_class` and still
+  reads lens files written before it. Blocks, the reference index, the
+  `omh reminder:` line and the consolidation brief (whose demote rows quote
+  USER.md and MEMORY.md) are rendered on a console only. Outside a repository
+  a console's allowlist is user-global plus the current thread, so a capture
+  made there (user scope by default) is recalled there; no project record is
+  admitted without a resolved project, and a shared surface still reads nothing
+  there. The whole pack now fits 9,000 characters, 1,000 under the 10,000 at
+  which Hermes keeps only the first and last 500 characters of a prefetch
+  (`tools/hook_output_spill.py`): the reference index stops at 600 characters
+  with one `<omitted count>` line, system blocks take the rest up to their
+  6,000 cap with wrapper and omission lines counted, and when that is not
+  enough lower-ranked blocks give down to a 3,000 floor, then index lines,
+  then the brief's demote rows. Records, the brief's `<do>` lines and closing
+  tags are never cut; the reminder and digest are whole or absent. The receipt
+  names only what the text carries and adds `pack_chars`. Gateway capture stays
+  refused until per-person and per-channel messenger memory lands.
 - **`ai-slop-cleaner` reaches OMC parity without a second keyword hook.** `AI
   slop`, `deslop review`, and the request-shaped `anti-slop pass`, `anti-slop
   review`, and `anti-slop sweep` reach the cleaner through the existing route

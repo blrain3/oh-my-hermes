@@ -727,7 +727,7 @@ class OpenAnswerTests(unittest.TestCase):
 
 def _provider(root: Path, **kwargs) -> OmhMemoryProvider:
     provider = OmhMemoryProvider(root / ".omh")
-    provider.initialize("s1", hermes_home=str(root / ".hermes"), agent_context="primary", cwd=str(root), **kwargs)
+    provider.initialize("s1", hermes_home=str(root / ".hermes"), agent_context="primary", cwd=str(root), **{"platform": "cli", **kwargs})
     return provider
 
 

@@ -27,7 +27,7 @@ from omh.plugin_bundle.omh.tools.memory_tool import MEMORY_ACTIONS, OMH_MEMORY_S
 from omh.profiles.setup import write_setup_profile
 from omh.workflows.memory import read_project_memory_policy, scan_project_memory_records
 from project_identity_fixture import seed_project_identity
-from test_memory_prefetch_canonical import provider, rendered_ids
+from test_memory_prefetch_canonical import SESSION, provider, rendered_ids
 from test_memory_provider_hermes_order import hermes_turn
 
 
@@ -43,9 +43,12 @@ class InProcessCaptureTests(unittest.TestCase):
         self.store = self.root / ".omh"
         self.paths = resolve_paths(self.store, self.root / ".hermes")
         self.enterContext(patch.dict(os.environ, {"OMH_HOME": str(self.store), "HERMES_HOME": str(self.root / ".hermes")}))
+        # Capture writes only in a session the provider described as an
+        # operator console; this is the CLI one Hermes starts.
+        provider(self.root)
 
     def call(self, cwd: Path | None = None, **args) -> dict:
-        return json.loads(omh_memory_handler({"action": "capture", **args}, cwd=str(cwd or self.root)))
+        return json.loads(omh_memory_handler({"action": "capture", **args}, cwd=str(cwd or self.root), session_id=SESSION))
 
     def test_schema_advertises_capture_beside_the_four_reads(self) -> None:
         self.assertEqual(

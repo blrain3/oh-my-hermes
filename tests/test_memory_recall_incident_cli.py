@@ -91,7 +91,7 @@ class MemoryRecallIncidentCliTests(unittest.TestCase):
             self.assertEqual(status, 0, stderr)
             record_id = json.loads(stdout)["record"]["record_id"]
             live = OmhMemoryProvider(home, hermes_home=root / "hermes")
-            live.initialize("session-a", hermes_home=str(root / "hermes"), agent_context="primary", cwd=str(root))
+            live.initialize("session-a", platform="cli", hermes_home=str(root / "hermes"), agent_context="primary", cwd=str(root))
             live.queue_prefetch("")
             live.prefetch("")
             receipt = live.latest_prefetch_receipt()

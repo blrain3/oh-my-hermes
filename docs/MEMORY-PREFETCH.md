@@ -109,12 +109,19 @@ identity includes both resolver version and project identity. Older v2 receipts
 remain structurally readable, but cannot establish current repository-bound
 recall evidence; identity/version mismatches are rejected.
 
-Delivery requires an explicit nonempty allowlist with a valid project entry.
-A missing required kind, invalid scope, or blank ref yields
-`scope_status: unresolved`, an empty disabled record pack, and
-`scope_unresolved`. It never falls back to all records or global-only recall.
-This is a record-selection boundary; separately governed blocks and a
-consolidation reminder aren't selected by this record allowlist.
+Delivery requires an explicit nonempty allowlist, with a valid project entry
+whenever a project identity resolved. A missing required kind, invalid scope,
+or blank ref yields `scope_status: unresolved`, an empty disabled record pack,
+and `scope_unresolved`. It never falls back to all records. With no project
+identity (outside any repository, or a repository whose identity does not
+resolve), an operator console's allowlist is user-global plus the current
+thread and requires no project entry (owner decision 2026-10-13): no project
+record is admitted there, and a capture made outside a repository, which
+defaults to user scope, is recalled where it was stated. A shared surface
+gets an empty allowlist there, as before. This is a record-selection boundary;
+separately governed blocks and a consolidation reminder aren't selected by
+this record allowlist, and reach an operator console only (see
+[Surface classes](MEMORY.md#surface-classes)).
 
 Scope and perspective mismatches disclose only aggregate exclusion counts,
 not foreign IDs or summaries. Records without a perspective pass each actor
@@ -180,7 +187,9 @@ turn. `prefetch` returns the already prepared pack; its query argument doesn't
 rerank that pack on the hot path.
 
 The pack contains system-tier blocks, a reference-block label index, the record
-section, and any current consolidation reminder. Record rendering preserves a
+section, and any current consolidation reminder, all within a 9,000-character
+whole-pack budget under Hermes' 10,000-character prefetch spill cap (see
+[The pack budget](MEMORY.md#the-pack-budget)). Record rendering preserves a
 prefix of the canonical selection. Its separate 2,400-character section budget
 includes XML tags, escaping, separators, and aggregate omission reports. Each
 summary projection is capped at 500 characters. A record that doesn't fit

@@ -257,7 +257,9 @@ def run_live_prefetch_arms(
     )
     adapter_receipt = build_prefetch_receipt(prepared, session_id=session_id, home_digests=snapshot.home_digests)
     live = OmhMemoryProvider(user_home, hermes_home=paths.hermes_home)
-    live.initialize(session_id, hermes_home=str(paths.hermes_home), agent_context="primary", cwd=str(project_root))
+    # The CLI session the adapter arm models: Hermes sends `platform or "cli"`
+    # (`agent/agent_init.py`), and an unnamed platform is a shared surface.
+    live.initialize(session_id, hermes_home=str(paths.hermes_home), platform="cli", agent_context="primary", cwd=str(project_root))
     live.queue_prefetch(query, now=now)
     live.prefetch(query)
     served = live.latest_prefetch_receipt()

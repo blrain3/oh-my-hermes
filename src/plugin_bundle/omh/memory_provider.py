@@ -35,9 +35,10 @@ from . import runtime_paths
 import hashlib
 import json
 import threading
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 # A missing optional module or exported symbol is a capability gap; an
 # internal import failure in an existing host module must still propagate.
@@ -75,7 +76,7 @@ from .memory_blocks import (
     read_memory_blocks,
     render_block_index,
     render_memory_blocks,
-    render_memory_blocks_counted,
+    render_memory_blocks_within,
     select_memory_blocks,
 )
 from .memory_dreaming import (
@@ -117,14 +118,18 @@ from .memory_session_digest import (
     write_session_close,
 )
 from .memory_session_lens import (
+    SURFACE_OPERATOR_CONSOLE,
+    memory_surface_class,
     note_session_records,
     publish_session_lens,
     read_session_lens,
     session_lens_path,
+    surface_flags,
     withdraw_session_lens,
 )
 from .memory_records import (
     PREFETCH_EXECUTOR_TARGET,
+    prefetch_required_scope_kinds,
     prefetch_scope_allowlist,
     prepare_prefetch_records,
     read_record_store_snapshot,
@@ -160,8 +165,36 @@ WRITE_FAILURE_LIMIT = 16
 
 # Hermes states that only a primary agent should write; a cron or subagent
 # context replaying its own system prompt would otherwise move the counters that
-# decide when consolidation is due.
-_WRITING_CONTEXTS = frozenset({"", "primary"})
+# decide when consolidation is due. That is the background surface class
+# (`memory_surface_class`), whose writes are off.
+
+# Hermes spills an external provider's prefetch result longer than this many
+# characters to a file and keeps only its first and last 500 in the prompt
+# (`DEFAULT_MAX_CHARS`, hermes-agent `tools/hook_output_spill.py`, applied by
+# `MemoryManager` in `agent/memory_manager.py`). Copied, not imported: OMH
+# does not import Hermes; tests/test_memory_pack_budget.py compares the copy.
+HERMES_PREFETCH_SPILL_MAX_CHARS = 10_000
+# The whole pack's budget. Past the spill cap the records in the middle of the
+# pack vanish while the receipt, `served.json` and the reminder ledger still
+# count them as served. Each section's own cap summed to about 11,300
+# characters before the reference index, which had none. The 1,000 characters
+# of margin absorb a smaller default in a later Hermes before the pin test
+# catches it, and keep the pack clear of the cap rather than at it.
+PACK_BUDGET_CHARS = 9_000
+# The reference index lists labels whose values stay behind `omh_memory read`;
+# past this it keeps a prefix and one `<omitted count=...>` line.
+REFERENCE_INDEX_PACK_MAX_CHARS = 600
+# System blocks take what the other sections leave, at most their own
+# section cap. Below the floor, index lines and then the brief's demote rows
+# give way first. The floor is what system blocks are left when every other
+# section sits at its cap with ordinary record ids (records 2,400, digest 512,
+# brief 1,600, index 600, a reminder near 750, separators): about 3,100. So
+# trimming past the blocks happens only when a section runs long, such as a
+# reminder about a record with a long imported id, and the top block at the
+# default 2,000-character block limit (about 2,200 with its element) still
+# fits whole beside a few omission lines.
+SYSTEM_BLOCKS_PACK_MAX_CHARS = DEFAULT_SYSTEM_RENDER_BUDGET_CHARS
+SYSTEM_BLOCKS_PACK_FLOOR_CHARS = 3_000
 
 # Moments after which this session gets no further turn. The turn interval
 # assumes a later turn will come; at these it will not, so a single
@@ -190,6 +223,9 @@ class OmhMemoryProvider(_MemoryProviderBase):
         self._principal_context: dict[str, object] | None = None
         self._profile_ref = ""
         self._turn_ref = ""
+        # Decided at `initialize` (`memory_surface_class`). Before it, as for
+        # `omh memory dream --evaluate`, the caller is the operator's own CLI.
+        self._surface_class = SURFACE_OPERATOR_CONSOLE
         self._shared_surface = False
         # Reviewed records live in the project's own `.omh` when a session runs
         # inside a repository; `initialize` resolves it from the working
@@ -287,9 +323,15 @@ class OmhMemoryProvider(_MemoryProviderBase):
         self._prepared_reminder, self._served_reminder, self._reminder_recorded = None, None, False
         self._prepared_record_ids, self._served_recorded = (), False
         self._session_id = str(session_id or "")
-        self._writes_enabled = str(kwargs.get("agent_context", "") or "") in _WRITING_CONTEXTS
-        platform = str(kwargs.get("platform", "") or "")
-        self._shared_surface = bool(kwargs.get("shared_surface", bool(platform and platform != "cli")))
+        # Hermes passes `platform` (`cli`, `tui`, `desktop`, a gateway name,
+        # `cron`, `subagent`) and `agent_context` (`agent/agent_init.py`,
+        # `_memory_provider_init_kwargs`); it never passes `principal_context`.
+        self._surface_class = memory_surface_class(
+            platform=kwargs.get("platform", ""),
+            agent_context=kwargs.get("agent_context", ""),
+            shared_surface=kwargs.get("shared_surface", False),
+        )
+        self._shared_surface, self._writes_enabled = surface_flags(self._surface_class)
         self._principal_context = parse_principal_context(
             kwargs.get("principal_context"),
             expected_session=self._session_id,
@@ -433,6 +475,7 @@ class OmhMemoryProvider(_MemoryProviderBase):
         if not self._session_id:
             return
         lens = {
+            "surface_class": self._surface_class,
             "shared_surface": self._shared_surface,
             "writes_enabled": self._writes_enabled,
             "principal_context": self._principal_context,
@@ -737,23 +780,27 @@ class OmhMemoryProvider(_MemoryProviderBase):
 
     def render_pack(self, *, now: datetime | None = None) -> str:
         """System blocks in full, reference blocks by label only, then the
-        reviewed records the canonical selector chose for the queued query."""
+        reviewed records the canonical selector chose for the queued query.
+
+        The operator's blocks, the open-record reminder and the consolidation
+        brief go to an operator console only. A shared surface is a chat other
+        people read, and a background run has nobody to ask; the brief's
+        demote rows even quote USER.md and MEMORY.md. Records and the digest
+        keep their own lens rules there. The whole pack fits
+        `PACK_BUDGET_CHARS` (`fit_prefetch_pack`), and the receipt names only
+        what the returned text carries.
+        """
         # None is a bound absence, not permission to inspect the process cwd.
         self._project_resolution = (
             resolve_project_identity(self._project_cwd) if self._project_cwd is not None
             else ProjectIdentityResolution(diagnostics=("outside_repository",))
         )
         moment = now or datetime.now(timezone.utc)
-        blocks = () if self._shared_surface else read_memory_blocks(self._omh_home)
+        console = self._surface_class == SURFACE_OPERATOR_CONSOLE
+        blocks = read_memory_blocks(self._omh_home) if console else ()
         selection = self._block_selection(blocks=blocks, now=moment)
         system_blocks = tuple(block for block in blocks if block.tier == SYSTEM_TIER)
         reference_blocks = tuple(block for block in blocks if block.tier == REFERENCE_TIER)
-        system, block_count = render_memory_blocks_counted(
-            system_blocks,
-            budget_chars=DEFAULT_SYSTEM_RENDER_BUDGET_CHARS,
-            evaluations=selection.evaluations,
-        )
-        index = render_block_index(reference_blocks, evaluations=selection.evaluations)
         # One selection contract for the live turn and the coding handoff:
         # explicit user-global/project/thread allowlist, the Hermes perspective
         # lens, and the selector's own lifecycle, ranking and budget ladder.
@@ -766,49 +813,63 @@ class OmhMemoryProvider(_MemoryProviderBase):
             now=moment,
             principal_context=self._principal_context,
             shared_surface=self._shared_surface,
+            required_scope_kinds=prefetch_required_scope_kinds(self._project_resolution.identity),
         )
-        records = prepared.section.text
-        # The count is what the renderer emitted, never what selection chose.
-        self._pack_count = block_count + len(prepared.section.rendered)
-        self._pack_has_memory = bool(system or index or records)
         # The reminder asks about the oldest open record whose review deadline
         # passed and whose last ask is older than `open_ask_days`, one line per
         # pack, inside the same explicit scope allowlist the selector used. It
         # is a question, not a memory: it never moves the recall count, and it
-        # is not asked on a shared surface, where a group chat would be asked
+        # is asked only on a console, never in a group chat that would be asked
         # to settle a question that belongs to the operator. Selecting here
         # only prepares it; `prefetch` is what turns it into an ask.
         self._prepared_reminder = None
         self._reminder_recorded = False
         self._prepared_record_ids, self._served_recorded = (), False
-        if not self._shared_surface:
-            self._prepared_reminder = select_open_reminder(
+        reminder = (
+            select_open_reminder(
                 snapshot.records,
                 read_open_reminders(self._record_homes()),
                 now=moment,
                 allowed_scopes=prepared.selection.scope_allowlist,
                 eligible_record_ids=_askable_record_ids(prepared.selection.pack),
             )
+            if console
+            else None
+        )
+        # The brief is a request, not a memory: it is served so the model can
+        # consolidate in this turn, and it never moves the recall count.
+        brief = read_latest_consolidation(self._omh_home) if console else None
+        # A status, not a memory either: counts only, and never the recall count.
+        digest = self._session_digest_section()
+        fitted = fit_prefetch_pack(
+            render_system=lambda budget: render_memory_blocks_within(system_blocks, total_chars=budget, evaluations=selection.evaluations),
+            render_index=lambda budget: render_block_index(reference_blocks, evaluations=selection.evaluations, budget_chars=budget),
+            render_brief=lambda rows: render_consolidation_brief(brief, hermes_home=self._hermes_home, max_demote_rows=rows),
+            records=prepared.section.text,
+            reminder=render_open_reminder(reminder) if reminder is not None else "",
+            digest=digest,
+        )
+        pack = fitted.text
+        # The count is what the renderer emitted, never what selection chose.
+        self._pack_count = fitted.block_count + len(prepared.section.rendered)
+        self._pack_has_memory = bool(fitted.system or fitted.index or fitted.records)
+        self._prepared_reminder = reminder if fitted.reminder else None
         self._prepared_receipt = build_prefetch_receipt(
             prepared,
             session_id=self._session_id,
             home_digests=snapshot.home_digests,
-            rendered_block_count=block_count,
+            rendered_block_count=fitted.block_count,
             project_resolution=self._project_resolution,
             reminder=self._prepared_reminder,
             unreadable=snapshot.unreadable,
             store_read_error=snapshot.store_read_error,
+            pack_chars=len(pack),
         )
-        reminder = render_open_reminder(self._prepared_reminder) if self._prepared_reminder is not None else ""
-        # The brief is a request, not a memory: it is served so the model can
-        # consolidate in this turn, and it never moves the recall count.
-        consolidation = render_consolidation_brief(read_latest_consolidation(self._omh_home), hermes_home=self._hermes_home)
-        # A status, not a memory either: counts only, and never the recall count.
-        digest = self._session_digest_section()
         # Last, so a render that raised leaves no ids beside the previous pack.
         self._prepared_record_ids = tuple(str(item["record_id"]) for item in prepared.section.rendered)
-        self._pack_digest_evaluated, self._pack_digest = self._digest_pending, digest
-        return "\n".join(part for part in (system, index, records, reminder, digest, consolidation) if part)
+        # A digest the budget left out stays pending for a later render.
+        self._pack_digest_evaluated, self._pack_digest = self._digest_pending and fitted.digest == digest, fitted.digest
+        return pack
 
     def _start_session_digest(self, *, initializing: bool) -> None:
         """Fix this session's digest window, before it serves or writes anything.
@@ -866,7 +927,9 @@ class OmhMemoryProvider(_MemoryProviderBase):
         Mirrors `memory_tool._in_session_scope` over this render's allowlist
         and principal context; lifecycle state is not a lens gate.
         """
-        scopes, status = resolve_scope_allowlist(self._prefetch_scopes(), required_scope_kinds=("project",))
+        scopes, status = resolve_scope_allowlist(
+            self._prefetch_scopes(), required_scope_kinds=prefetch_required_scope_kinds(self._project_resolution.identity)
+        )
         principal, shared = self._principal_context, self._shared_surface
 
         def admits(record: dict[str, Any]) -> bool:
@@ -1490,7 +1553,79 @@ def _non_negative_int(value: object) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
 
 
-def render_consolidation_brief(brief: dict[str, Any] | None, *, hermes_home: str | Path | None = None) -> str:
+@dataclass(frozen=True)
+class FittedPack:
+    """The sections one prefetch returns, each already closed, in pack order."""
+
+    system: str
+    block_count: int
+    index: str
+    records: str
+    reminder: str
+    digest: str
+    brief: str
+
+    @property
+    def text(self) -> str:
+        return "\n".join(part for part in (self.system, self.index, self.records, self.reminder, self.digest, self.brief) if part)
+
+
+def fit_prefetch_pack(
+    *,
+    render_system: Callable[[int], tuple[str, int]],
+    render_index: Callable[[int], str],
+    render_brief: Callable[[int | None], str],
+    records: str,
+    reminder: str,
+    digest: str,
+    budget: int | None = None,
+) -> FittedPack:
+    """Every section inside one budget, so Hermes never spills the pack.
+
+    The records, the reminder, the digest and the brief are rendered at their
+    own caps, the reference index at `REFERENCE_INDEX_PACK_MAX_CHARS`, and the
+    system blocks take what is left, at most `SYSTEM_BLOCKS_PACK_MAX_CHARS`.
+    What gives, in order: system blocks down to the floor (or to their own
+    size when smaller), then index lines, then the brief's demote rows, then
+    system blocks below the floor. Each renderer returns a closed section or
+    nothing, so no closing tag, no record and no `<do>` line of the brief is
+    ever cut. The reminder and the digest are whole or absent; with the
+    sections at their caps they always fit, so dropping them (reminder first)
+    is the last resort that keeps the bound unconditional.
+    """
+    budget = PACK_BUDGET_CHARS if budget is None else budget
+    index = render_index(REFERENCE_INDEX_PACK_MAX_CHARS)
+    brief = render_brief(None)
+
+    def rest() -> int:
+        return len("\n".join(part for part in (index, records, reminder, digest, brief) if part))
+
+    def room() -> int:
+        # One separator between the system section and the rest.
+        length = rest()
+        return budget - length - (1 if length else 0)
+
+    wanted = min(SYSTEM_BLOCKS_PACK_FLOOR_CHARS, len(render_system(SYSTEM_BLOCKS_PACK_MAX_CHARS)[0]))
+    if room() < wanted and index:
+        index = render_index(max(len(index) - (wanted - room()), 0))
+    for rows in range(DEMOTION_BRIEF_MAX_ROWS - 1, -1, -1):
+        if room() >= wanted or not brief:
+            break
+        brief = render_brief(rows)
+    if rest() > budget:
+        reminder = ""
+    if rest() > budget:
+        digest = ""
+    system, block_count = render_system(max(min(SYSTEM_BLOCKS_PACK_MAX_CHARS, room()), 0))
+    return FittedPack(system, block_count, index, records, reminder, digest, brief)
+
+
+def render_consolidation_brief(
+    brief: dict[str, Any] | None,
+    *,
+    hermes_home: str | Path | None = None,
+    max_demote_rows: int | None = None,
+) -> str:
     """The due brief as one bounded prompt section; "" when nothing is due.
 
     Measured before this existed: 32 briefs in seven days on one machine,
@@ -1521,6 +1656,9 @@ def render_consolidation_brief(brief: dict[str, Any] | None, *, hermes_home: str
             f' duplicate_clusters="{len(clusters)}" />'
         )
     rows = _demotion_row_lines(brief.get("demotion_rows"), hermes_home)
+    if max_demote_rows is not None:
+        # The pack's budget asked for fewer: the rows are the brief's only part that gives.
+        rows = rows[: max(max_demote_rows, 0)]
     # A per-file headroom line only for a file that has a reason or an offered
     # row: the others are not why this brief exists, and each line costs budget
     # the rows need.

@@ -52,9 +52,9 @@ class ProjectIdentityTests(unittest.TestCase):
         record = memory.approve_project_memory_candidate(paths, candidate["candidate_id"])["record"]
         assert isinstance(record, dict)
         live = OmhMemoryProvider(paths.omh_home)
-        live.initialize("s", cwd=b)
+        live.initialize("s", platform="cli", cwd=b)
         self.assertNotIn(record["record_id"], live.prefetch())
-        live.initialize("s", cwd=a)
+        live.initialize("s", platform="cli", cwd=a)
         self.assertIn(record["record_id"], live.prefetch())
         self.assertEqual(candidate["scope"]["ref"], self.api.resolve_project_identity(a).identity)
 
@@ -75,10 +75,10 @@ class ProjectIdentityTests(unittest.TestCase):
         record = memory.approve_project_memory_candidate(paths, candidate["candidate_id"])["record"]
         assert isinstance(record, dict)
         provider = OmhMemoryProvider(paths.omh_home)
-        provider.initialize("local", cwd=b)
+        provider.initialize("local", platform="cli", cwd=b)
         self.assertNotIn(record["record_id"], provider.prefetch())
         self.assertNotEqual(first.identity, second.identity)
-        provider.initialize("local", cwd=a)
+        provider.initialize("local", platform="cli", cwd=a)
         self.assertIn(record["record_id"], provider.prefetch())
         config = a / ".git" / "config"
         for remote in ((a.parent / "upstream.git").as_posix(), (a.parent / "upstream.git").as_uri()):
@@ -161,7 +161,7 @@ class ProjectIdentityTests(unittest.TestCase):
         record = memory.approve_project_memory_candidate(paths, candidate["candidate_id"])["record"]
         assert isinstance(record, dict)
         provider = OmhMemoryProvider(paths.omh_home)
-        provider.initialize("external", cwd=repo)
+        provider.initialize("external", platform="cli", cwd=repo)
         self.assertIn(record["record_id"], provider.prefetch())
         with chdir(repo):
             for reference in (identity, ""):
@@ -242,7 +242,7 @@ class ProjectIdentityTests(unittest.TestCase):
         record = memory.approve_project_memory_candidate(paths, candidate["candidate_id"])["record"]
         assert isinstance(record, dict)
         provider = OmhMemoryProvider(paths.omh_home)
-        provider.initialize("s", cwd=repo)
+        provider.initialize("s", platform="cli", cwd=repo)
         provider.prefetch()
         receipt = provider.latest_prefetch_receipt()
         assert receipt is not None
@@ -276,7 +276,7 @@ class ProjectIdentityTests(unittest.TestCase):
             memory.capture_project_memory_candidate(paths, "must not silently widen")
         self.assertFalse(paths.memory_dir.exists())
         live = OmhMemoryProvider(paths.omh_home)
-        live.initialize("s", cwd=repo)
+        live.initialize("s", platform="cli", cwd=repo)
         self.assertEqual(live.prefetch(), "")
         receipt = live.latest_prefetch_receipt()
         assert receipt is not None
@@ -285,7 +285,11 @@ class ProjectIdentityTests(unittest.TestCase):
         self.assertEqual(receipt["project_identity"], "")
         self.assertEqual(receipt["lens"]["project_identity_state"], "unresolved")
         self.assertEqual(receipt["lens"]["project_identity_diagnostics"], ["remote_absent"])
-        self.assertEqual(receipt["lens"]["scope_allowlist"], [])
+        # A console with no resolved project reads user-global and its own
+        # thread (owner decision 2026-10-13); no project label, so no project
+        # record can widen into it.
+        self.assertEqual(receipt["lens"]["scope_allowlist"], [{"kind": "thread", "ref": "s"}, {"kind": "user-global", "ref": "default"}])
+        self.assertEqual(receipt["lens"]["scope_status"], "resolved")
 
 
 if __name__ == "__main__":

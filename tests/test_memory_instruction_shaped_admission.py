@@ -32,6 +32,7 @@ from omh.plugin_bundle.omh.tools import memory_tool
 from omh.plugin_bundle.omh.tools.memory_tool import omh_memory_handler
 from omh.workflows import memory as workflows_memory
 from project_identity_fixture import memory_paths, seed_project_identity
+from test_memory_prefetch_canonical import SESSION, provider
 from test_design_direction_iteration_actions import _paths as design_paths
 from test_design_direction_iteration_actions import _prepared as prepared_design_iteration
 
@@ -106,13 +107,21 @@ class ModelCaptureRefusalTests(unittest.TestCase):
         (self.root / ".hermes").mkdir()
         self.store = self.root / ".omh"
         self.enterContext(patch.dict(os.environ, {"OMH_HOME": str(self.store), "HERMES_HOME": str(self.root / ".hermes")}))
+        # Capture writes only in a session the provider described as an
+        # operator console; this is the CLI one Hermes starts.
+        provider(self.root)
 
     def call(self, **args) -> dict:
-        return json.loads(omh_memory_handler({"action": "capture", **args}, cwd=str(self.root)))
+        return json.loads(omh_memory_handler({"action": "capture", **args}, cwd=str(self.root), session_id=SESSION))
 
     def stored_files(self) -> list[str]:
+        # The session lens is the provider's bookkeeping, not the record store.
         memory_dir = self.store / "memory"
-        return sorted(str(path.relative_to(memory_dir)) for path in memory_dir.rglob("*.json")) if memory_dir.exists() else []
+        return sorted(
+            str(path.relative_to(memory_dir))
+            for path in (memory_dir.rglob("*.json") if memory_dir.exists() else ())
+            if path.relative_to(memory_dir).parts[0] != "sessions"
+        )
 
     def test_instruction_shaped_summaries_are_refused_with_reason_and_fix(self) -> None:
         for summary, cue in INSTRUCTION_SENTENCES:

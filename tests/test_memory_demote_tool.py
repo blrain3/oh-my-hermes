@@ -39,7 +39,7 @@ from omh.plugin_bundle.omh.tools.memory_tool import omh_memory_handler
 from omh.profiles.setup import write_setup_profile
 from omh.workflows.memory import reject_project_memory_candidate
 from project_identity_fixture import seed_project_identity
-from test_memory_prefetch_canonical import provider
+from test_memory_prefetch_canonical import SESSION, provider
 from test_memory_provider_hermes_order import hermes_turn
 
 FACT = "The operator deploys from the release branch every Friday afternoon, never from main."
@@ -103,13 +103,17 @@ class _Home(unittest.TestCase):
         self.store = self.root / ".omh"
         self.paths = resolve_paths(self.store, self.hermes)
         self.enterContext(patch.dict(os.environ, {"OMH_HOME": str(self.store), "HERMES_HOME": str(self.hermes)}))
+        # Demote writes only in a session the provider described as an
+        # operator console; this is the CLI one Hermes starts.
+        provider(self.root)
 
     def demote(self, digest: str) -> dict:
-        return json.loads(omh_memory_handler({"action": "demote", "entry_sha256": digest}, cwd=str(self.root)))
+        return json.loads(omh_memory_handler({"action": "demote", "entry_sha256": digest}, cwd=str(self.root), session_id=SESSION))
 
     def store_files(self) -> list[Path]:
+        # The session lens is the provider's bookkeeping, not the record store.
         memory = self.store / "memory"
-        return sorted(path for path in memory.rglob("*.json")) if memory.exists() else []
+        return sorted(path for path in memory.rglob("*.json") if path.relative_to(memory).parts[0] != "sessions") if memory.exists() else []
 
     def seed_record(self, summary: str, *, scope_kind: str = "user-global", retention: str = "durable", source_ref: str = "") -> str:
         payload = capture_project_memory_candidate(
@@ -325,11 +329,11 @@ class DemoteToolTests(_Home):
         self.assert_removal_is_safe(result, [FACT, sibling], FACT)
 
     def test_display_line_rides_a_remembered_capture_and_not_a_refusal(self) -> None:
-        remembered = json.loads(omh_memory_handler({"action": "capture", "summary": FACT, "scope": "user"}, cwd=str(self.root)))
+        remembered = json.loads(omh_memory_handler({"action": "capture", "summary": FACT, "scope": "user"}, cwd=str(self.root), session_id=SESSION))
         self.assertEqual(remembered["status"], "remembered", remembered)
         self.assertTrue(remembered["display_line"].startswith("📌 OMH remembered: "))
         self.assertLessEqual(len(remembered["display_line"]), len("📌 OMH remembered: ") + 81)
-        refused = json.loads(omh_memory_handler({"action": "capture", "summary": ""}, cwd=str(self.root)))
+        refused = json.loads(omh_memory_handler({"action": "capture", "summary": ""}, cwd=str(self.root), session_id=SESSION))
         self.assertEqual(refused["status"], "refused")
         self.assertNotIn("display_line", refused)
 

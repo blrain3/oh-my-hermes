@@ -58,7 +58,7 @@ def approve(root: Path, summary: str, *, home: str = ".omh", captured_at: str = 
 
 def provider(root: Path, *, cwd: Path | None = None, session_id: str = SESSION, **kwargs: Any) -> OmhMemoryProvider:
     live = OmhMemoryProvider(root / ".omh")
-    live.initialize(session_id, hermes_home=str(root / ".hermes"), agent_context="primary", cwd=str(cwd or root), **kwargs)
+    live.initialize(session_id, hermes_home=str(root / ".hermes"), agent_context="primary", cwd=str(cwd or root), **{"platform": "cli", **kwargs})
     return live
 
 
@@ -127,8 +127,13 @@ class CanonicalPrefetchTests(unittest.TestCase):
         allowlist = memory_records.prefetch_scope_allowlist(project_identity="repo", session_id="s1")
         self.assertEqual(allowlist, [GLOBAL, {"kind": "project", "ref": "repo"}, {"kind": "thread", "ref": "s1"}])
         self.assertEqual(memory_records.prefetch_scope_allowlist(project_identity="repo"), [GLOBAL, {"kind": "project", "ref": "repo"}])
-        self.assertEqual(memory_records.prefetch_scope_allowlist(project_identity="", session_id="s1"), [])
-        self.assertEqual(memory_records.prefetch_scope_allowlist(project_identity="  ", session_id="s1"), [])
+        # No project resolved (owner decision 2026-10-13): the project label
+        # goes, the rest stays, and a shared surface still gets nothing.
+        self.assertEqual(memory_records.prefetch_scope_allowlist(project_identity="", session_id="s1"), [GLOBAL, {"kind": "thread", "ref": "s1"}])
+        self.assertEqual(memory_records.prefetch_scope_allowlist(project_identity="  ", session_id="s1"), [GLOBAL, {"kind": "thread", "ref": "s1"}])
+        self.assertEqual(memory_records.prefetch_scope_allowlist(project_identity="", session_id="s1", include_legacy_personal=False), [])
+        self.assertEqual(memory_records.prefetch_required_scope_kinds("repo"), ("project",))
+        self.assertEqual(memory_records.prefetch_required_scope_kinds("  "), ())
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             repo = root / "repo"

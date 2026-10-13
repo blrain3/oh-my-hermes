@@ -173,21 +173,36 @@ def prefetch_scope_allowlist(
 ) -> list[dict[str, str]]:
     """Explicit user-global, current project and current thread labels.
 
-    Nothing is inferred from a stored record. A blank project identity yields
-    an empty allowlist, which the selector resolves to `scope_unresolved` and
-    an empty pack: fail closed rather than widen to a wildcard.
+    Nothing is inferred from a stored record, and nothing ever widens to a
+    wildcard. A blank project identity drops the project label rather than
+    the whole allowlist, on a nonshared surface only (owner decision
+    2026-10-13). Before that it yielded an empty allowlist and an empty pack,
+    and a capture made outside a repository defaults to user scope, so every
+    such fact was written and then never recalled where it was stated. The
+    project label is what keeps one repository's records out of another; with
+    none resolved, no project record is admitted at all, and what remains is
+    a subset of the allowlist the same session would get inside any
+    repository. A shared surface reads no user-global record, so its
+    allowlist stays empty and fails closed as before.
+    `prefetch_required_scope_kinds` is the matching requirement.
     """
     identity = str(project_identity or "").strip()
-    if not identity:
+    if not identity and not include_legacy_personal:
         return []
     scopes = ([{"kind": "user-global", "ref": "default"}] if include_legacy_personal else [])
-    scopes.append({"kind": "project", "ref": identity})
+    if identity:
+        scopes.append({"kind": "project", "ref": identity})
     if principal_ref:
         scopes.append({"kind": "user", "ref": principal_ref})
     thread = str(session_id or "").strip()
     if thread:
         scopes.append({"kind": "thread", "ref": thread})
     return scopes
+
+
+def prefetch_required_scope_kinds(project_identity: str) -> tuple[str, ...]:
+    """A project label is required exactly when one resolved; see `prefetch_scope_allowlist`."""
+    return ("project",) if str(project_identity or "").strip() else ()
 
 
 def select_prefetch_records(
@@ -204,13 +219,14 @@ def select_prefetch_records(
     query_intent: str | None = None,
     principal_context: dict[str, object] | None = None,
     shared_surface: bool = False,
+    required_scope_kinds: tuple[str, ...] = ("project",),
 ) -> MemoryRecallSelection:
     """The canonical selection for a live prefetch: delivery mode, never inspection."""
     return select_memory_recall(
         list(snapshot.records),
         str(query or ""),
         allowed_scopes=list(allowed_scopes),
-        required_scope_kinds=("project",),
+        required_scope_kinds=required_scope_kinds,
         inspection=False,
         review_resolver=snapshot.reviews,
         operation_states=snapshot.operation_states,
@@ -243,6 +259,7 @@ def prepare_prefetch_records(
     query_intent: str | None = None,
     principal_context: dict[str, object] | None = None,
     shared_surface: bool = False,
+    required_scope_kinds: tuple[str, ...] = ("project",),
 ) -> PreparedPrefetch:
     """Select, then render, under one clock. The receipt is built from this."""
     clock = now if now is not None else _utc_now()
@@ -259,6 +276,7 @@ def prepare_prefetch_records(
         query_intent=query_intent,
         principal_context=principal_context,
         shared_surface=shared_surface,
+        required_scope_kinds=required_scope_kinds,
     )
     return PreparedPrefetch(selection, render_selected_memory_records(selection, snapshot.records, budget_chars=budget_chars), clock)
 
@@ -570,6 +588,7 @@ __all__ = [
     "RECORD_SUMMARY_LIMIT_CHARS",
     "RecordStoreSnapshot",
     "RenderedRecordSection",
+    "prefetch_required_scope_kinds",
     "prefetch_scope_allowlist",
     "prepare_prefetch_records",
     "read_project_memory_records",

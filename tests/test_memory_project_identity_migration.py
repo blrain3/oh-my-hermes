@@ -205,10 +205,10 @@ class ProjectIdentityMigrationTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "injected_after_successor_write"):
                 self.migrate(report["report_digest"])
         provider = OmhMemoryProvider(self.paths.omh_home)
-        provider.initialize("s", cwd=self.root)
+        provider.initialize("s", platform="cli", cwd=self.root)
         self.assertNotIn(self.record["record_id"], provider.prefetch())
         self.migrate(report["report_digest"])
-        provider.initialize("s", cwd=self.root)
+        provider.initialize("s", platform="cli", cwd=self.root)
         self.assertIn(self.record["record_id"], provider.prefetch())
 
     def test_interrupted_rollback_resumes_without_rewriting_original(self):
@@ -235,7 +235,7 @@ class ProjectIdentityMigrationTests(unittest.TestCase):
         stable = self.memory.approve_project_memory_candidate(self.paths, candidate["candidate_id"])["record"]
         assert isinstance(stable, dict)
         live = OmhMemoryProvider(self.paths.omh_home)
-        live.initialize("s", cwd=self.root)
+        live.initialize("s", platform="cli", cwd=self.root)
         text = live.prefetch()
         self.assertIn(stable["record_id"], text)
         self.assertNotIn(self.record["record_id"], text)

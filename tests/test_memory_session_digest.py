@@ -711,10 +711,10 @@ class SharedSurfaceDigestTests(unittest.TestCase):
 
     def test_a_shared_surface_counts_only_what_its_lens_admits(self) -> None:
         # Today the shared lens admits no identity-unbound record, so nothing here counts.
-        self.assertNotIn("<memory_digest", hermes_turn(start(self.home, self.root, "tui-1", platform="tui"), 1, "hello"))
+        self.assertNotIn("<memory_digest", hermes_turn(start(self.home, self.root, "discord-1", platform="discord"), 1, "hello"))
 
     def test_an_admitted_record_is_counted_with_no_since_and_no_unscoped_kind(self) -> None:
-        live = start(self.home, self.root, "tui-1", platform="tui")
+        live = start(self.home, self.root, "discord-1", platform="discord")
         with patch.object(OmhMemoryProvider, "_recall_lens", return_value=lambda record: True):
             live.on_turn_start(1, "hello")
             pack = live.prefetch("hello")
@@ -738,7 +738,7 @@ class SharedSurfaceDigestTests(unittest.TestCase):
         ]
         # In scope, but seen from another executor's perspective.
         records.append({"schema_version": "project_memory_record/v2", "record_id": "r4", "scope": {"kind": "user-global", "ref": "default"}, "perspective": {"observer": "codex", "observed": "codex"}})
-        for platform in ("cli", "tui"):
+        for platform in ("cli", "tui", "discord"):
             with self.subTest(platform=platform):
                 live = start(self.home, self.root, f"{platform}-lens", platform=platform)
                 lens = memory_tool._session_lens({"session_id": f"{platform}-lens"})

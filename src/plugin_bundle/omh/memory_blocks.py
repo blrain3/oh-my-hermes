@@ -319,20 +319,71 @@ def render_memory_blocks_counted(
     return "\n".join(lines), rendered
 
 
+def render_memory_blocks_within(
+    blocks: tuple[MemoryBlock, ...] | list[MemoryBlock],
+    *,
+    total_chars: int,
+    evaluations: dict[str, dict[str, object]] | None = None,
+) -> tuple[str, int]:
+    """System blocks for the prefetch pack, the whole section inside ``total_chars``.
+
+    `render_memory_blocks_counted` budgets block elements only; here the
+    wrapper and every omission line count too, because the pack has one
+    budget for everything it hands Hermes. Blocks are kept in rank order and
+    a block that does not fit is dropped whole, never clipped; the dropped
+    blocks stay readable through `omh_memory read`. Omission lines that do not
+    fit become one ``<omitted count=...>`` line. ``""`` when not even an empty
+    section fits.
+    """
+    eligible, evaluated = _renderable(blocks, evaluations)
+    if not blocks:
+        return "", 0
+    ineligible = _render_omissions(_omissions(blocks, evaluated))
+
+    def section(kept: list[MemoryBlock]) -> str:
+        kept_ids = {block.block_id for block in kept}
+        dropped = [
+            {"block_id": block.block_id, "revision": block.revision, "reason_code": "render_budget_exhausted"}
+            for block in eligible
+            if block.block_id not in kept_ids
+        ]
+        return _framed_section(
+            "<memory_blocks>", [_render_block(block) for block in kept], [*ineligible, *_render_omissions(dropped)], "</memory_blocks>", total_chars
+        )
+
+    kept: list[MemoryBlock] = []
+    for block in eligible:
+        if section([*kept, block]):
+            kept.append(block)
+    return section(kept), len(kept)
+
+
 def render_block_index(
     blocks: tuple[MemoryBlock, ...] | list[MemoryBlock],
     *,
     evaluations: dict[str, dict[str, object]] | None = None,
+    budget_chars: int | None = None,
 ) -> str:
+    """Reference blocks by label; with ``budget_chars``, a prefix of the lines and one count line for the rest."""
     eligible, evaluated = _renderable(blocks, evaluations)
     if not blocks:
         return ""
-    lines = ["<memory_block_index>"]
-    for block in eligible:
-        lines.append(f'  <block label="{block.label}" chars="{block.chars}" limit="{block.limit}">{block.description}</block>')
+    lines = [f'  <block label="{block.label}" chars="{block.chars}" limit="{block.limit}">{block.description}</block>' for block in eligible]
     lines.extend(_render_omissions(_omissions(blocks, evaluated)))
-    lines.append("</memory_block_index>")
-    return "\n".join(lines)
+    if budget_chars is None:
+        return "\n".join(["<memory_block_index>", *lines, "</memory_block_index>"])
+    return _framed_section("<memory_block_index>", [], lines, "</memory_block_index>", budget_chars)
+
+
+def _framed_section(open_tag: str, kept: list[str], optional: list[str], close_tag: str, budget_chars: int) -> str:
+    """``kept`` whole, the longest prefix of ``optional`` that fits, one count line for the rest; "" if none fits."""
+    for shown in range(len(optional), -1, -1):
+        rest = len(optional) - shown
+        tail = [f'  <omitted count="{rest}" />'] if rest else []
+        text = "\n".join([open_tag, *kept, *optional[:shown], *tail, close_tag])
+        if len(text) <= budget_chars:
+            return text
+    return ""
 
 
 def _renderable(blocks: tuple[MemoryBlock, ...] | list[MemoryBlock], evaluations: dict[str, dict[str, object]] | None) -> tuple[list[MemoryBlock], dict[str, dict[str, object]]]:

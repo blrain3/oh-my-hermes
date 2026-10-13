@@ -52,6 +52,7 @@ def build_prefetch_receipt(
     reminder: dict[str, object] | None = None,
     unreadable: tuple[str, ...] | list[str] = (),
     store_read_error: bool = False,
+    pack_chars: int | None = None,
 ) -> dict[str, Any]:
     """Bind one selection and its rendering to configuration, lens, session and store.
 
@@ -134,6 +135,9 @@ def build_prefetch_receipt(
             ],
             "omission_counts": {str(key): int(value) for key, value in section.omissions.items()},
             "rendered_block_count": max(int(rendered_block_count), 0),
+            # The length of the whole text the provider returns, every section
+            # included; None when the receipt describes a record section alone.
+            "pack_chars": max(int(pack_chars), 0) if pack_chars is not None else None,
         },
         "reminder": _reminder_projection(reminder),
         "write_failures_count": 0,
@@ -223,6 +227,9 @@ def validate_prefetch_receipt(value: object) -> list[str]:
         rendered = rendering["rendered_records"]
         if rendering.get("rendered_count") != len(rendered):
             errors.append("rendering.rendered_count")
+        # Absent on a receipt an earlier bundle wrote.
+        if rendering.get("pack_chars") is not None and not _non_negative_int(rendering["pack_chars"]):
+            errors.append("rendering.pack_chars")
         if not all(isinstance(item, dict) and isinstance(item.get("record_id"), str) and _hex64(item.get("content_digest")) for item in rendered):
             errors.append("rendering.rendered_records")
         if isinstance(selection, dict) and isinstance(selection.get("selected_record_ids"), list):

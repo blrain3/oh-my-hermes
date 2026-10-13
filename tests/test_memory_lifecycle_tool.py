@@ -150,7 +150,8 @@ class ProviderLensTests(_Home):
         # (platform, shared surface, writes enabled) as the provider decides them.
         for platform, shared, writes in (
             ("cli", False, True),
-            ("tui", True, True),
+            ("tui", False, True),
+            ("desktop", False, True),
             ("telegram", True, True),
             ("cron", True, False),
             ("subagent", True, False),
